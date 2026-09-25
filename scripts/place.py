@@ -409,5 +409,27 @@ def main():
     return solve(args.net, out, pins, args.report)
 
 
+def _main_guarded():
+    """
+    把"工具自己崩了"与"有标注摆不开"分开。
+
+    `solve()` 返回 1 表示**有标注摆不开**(仍写出了可用的偏移表), 这是良性的;
+    build.py 见到 1 会继续编译。但裸的未捕获异常会让 Python 以 **1** 退出 ——
+    于是 place.py **崩溃**和"摆不开"同码, build.py 无从区分, 崩溃被当成
+    良性继续往下跑, 而标注用的是陈旧的/根本没生成的偏移表。
+
+    这里兜住所有异常, 以 2 退出(与"用法错误"同码, 都是"工具没跑成")。
+    """
+    try:
+        return main()
+    except Exception as e:                       # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print(f"place.py 内部错误: {type(e).__name__}: {e}", file=sys.stderr)
+        print("→ 这是工具缺陷, 不是你的图的问题。偏移**没有**算出来, "
+              "别当成功。", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main_guarded())

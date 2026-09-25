@@ -78,7 +78,7 @@ python scripts/build.py circuit --svg
 # 单独跑某一道
 python scripts/place.py circuit.net --report              # 标注自动摆位
 python scripts/check_tex_net.py --show-nets circuit.net   # 电气门 + 网表
-python scripts/selftest_tex.py                            # 回归 32 用例
+python scripts/selftest_tex.py                            # 回归 43 用例
 ```
 
 完整的工作流、宏速查、电气陷阱见 **[SKILL.md](SKILL.md)**（写图前读
@@ -120,7 +120,7 @@ scripts/
   sidecar.py                 侧车解析 + 连通性并查集
   check_tex_layout.py        排版门
   check_tex_net.py           电气门
-  selftest_tex.py            回归测试（32 用例）
+  selftest_tex.py            回归测试（43 用例）
 assets/
   stm32tikz.sty              核心宏包
   example_photodiode_relay.tex  完整示例，可照抄

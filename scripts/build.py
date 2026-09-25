@@ -126,17 +126,28 @@ def main():
             cmd.append("--report")
         r = run(cmd)
         print("  " + (r.stdout or "").strip().replace("\n", "\n  "))
-        if r.returncode in (0, 1):
-            print("[3/5] xelatex (第 2 遍, 偏移生效)")
-            ok2, out2 = tex_compile(stem, env)
-            if not ok2:
-                print("  第二遍编译失败:")
-                for ln in first_errors(out2):
-                    print("    " + ln)
-                return 2
-            print("  ok")
-        else:
-            print("[3/5] 跳过")
+        # place.py 的退出码: 0 = 全摆开, 1 = 有摆不开的(仍写偏移), >=2 = 工具错误。
+        # **>=2 必须让整条 build 失败** —— 此前一律继续, 于是 place.py 崩了
+        # (参数错、读不到实体)时 build 仍报"全绿", 而标注其实用的是上一次的
+        # 偏移表, 甚至根本没有偏移表。
+        if r.returncode >= 2:
+            print(f"  place.py 失败 (rc={r.returncode}) —— 标注偏移没算出, 停。",
+                  file=sys.stderr)
+            if r.stderr:
+                print("  " + r.stderr.strip().replace("\n", "\n  "),
+                      file=sys.stderr)
+            return 2
+        if r.returncode == 1:
+            print("  ⚠ 有标注**摆不开**(仍尽量给了偏移) —— 见上面的 [挤] 报告。",
+                  file=sys.stderr)
+        print("[3/5] xelatex (第 2 遍, 偏移生效)")
+        ok2, out2 = tex_compile(stem, env)
+        if not ok2:
+            print("  第二遍编译失败:")
+            for ln in first_errors(out2):
+                print("    " + ln)
+            return 2
+        print("  ok")
     else:
         print("[2/5] 自动摆位: 关掉了 (--no-place)")
         print("[3/5] 跳过")
@@ -147,10 +158,20 @@ def main():
     rc_n, o_n = gate("check_tex_net.py", net)
     for o in (o_l, o_n):
         for ln in o.rstrip().splitlines():
-            if ln.startswith("=====") or ln.startswith("==") or "  [" in ln:
+            if (ln.startswith("=====") or ln.startswith("==") or "  [" in ln
+                    or ln.startswith("错误:")):
                 print("  " + ln)
+    # rc=2 表示"输入有问题/侧车根本没检查" —— 与"检查了且有问题"不同, 但也
+    # 绝不能算过。此前只把非 0 与 0 二分, 空/缺失侧车被当成 rc=0 放过去了。
     if rc_l == 0 and rc_n == 0:
         print("  排版 0 / 电气 0 —— 全绿")
+    elif 2 in (rc_l, rc_n):
+        # rc=2 是"输入没检查成"(缺失/空侧车/用法错), 与 rc=1"查了有问题"
+        # 是两回事。混在一起会让人以为"电路有问题", 实际是**门根本没跑起来**。
+        print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— **有门没检查成**(见错误行)。")
+        for o, rc in ((o_l, rc_l), (o_n, rc_n)):
+            if rc != 0:
+                print(o)
     else:
         print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— 有问题:")
         for o, rc in ((o_l, rc_l), (o_n, rc_n)):
@@ -158,19 +179,40 @@ def main():
                 print(o)
 
     # ---- SVG ----
+    svg_fail = False
     if args.svg:
         print("[5/5] pdftocairo -svg")
         pdf = stem + ".pdf"
+        svg = stem + ".svg"
         if not os.path.exists(pdf):
-            print("  跳过(没有 .pdf)")
+            print("  失败: 没有 .pdf —— 上一遍编译没产出 PDF", file=sys.stderr)
+            svg_fail = True
         elif not shutil.which("pdftocairo"):
-            print("  跳过(没装 pdftocairo; .pdf 已经能用)")
+            print("  失败: 你**明确要了** --svg 但没装 pdftocairo。",
+                  file=sys.stderr)
+            print("        → 装 poppler(pdftocairo) 后重跑; "
+                  "或去掉 --svg 只要 .pdf。", file=sys.stderr)
+            svg_fail = True
         else:
-            r = run(["pdftocairo", "-svg", f"{stem}.pdf", f"{stem}.svg"])
-            print("  ok" if r.returncode == 0 else f"  失败: {r.stderr[:200]}")
+            if os.path.exists(svg):
+                os.remove(svg)          # 先删, 好判断这次是否真的产出
+            r = run(["pdftocairo", "-svg", pdf, svg])
+            # pdftocairo **失败也返回 0**(实测: 输入不存在时 rc=0, 只是不打
+            # 印文件)。所以必须查产物在不在, 不能只看退出码。
+            if r.returncode != 0 or not os.path.exists(svg):
+                print(f"  失败: pdftocairo rc={r.returncode}, "
+                      f"SVG {'没产出' if not os.path.exists(svg) else '已产出'}"
+                      f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
+                svg_fail = True
+            else:
+                print("  ok")
     else:
         print("[5/5] SVG: 未请求 (加 --svg)")
 
+    if svg_fail:
+        return 2                       # 明确请求的产物没出来 -> 整条失败
+    if 2 in (rc_l, rc_n):
+        return 2                       # 有门没检查成(输入问题), 不是"电路有问题"
     return 0 if (rc_l == 0 and rc_n == 0) else 1
 
 

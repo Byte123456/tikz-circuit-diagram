@@ -25,8 +25,18 @@ r"""
 """
 import os
 
-TOL = 0.8                      # 端点落在另一线段上的容差(pt)
+TOL = 0.8                      # 端点落在另一线段上 / 两个点直接对接的容差(pt)
 JUNCTION_TOL = 1.5             # 结点与交点匹配的容差(pt)
+# "近似接触"的搜索半径。>TOL 但 <=NEAR_TOL 的两个点**不算连通**, 但值得报 ——
+# 它们正是"你以为接上了、实际差一点"的那一类: 图上看着贴住, 电气上是断的。
+# 实测真图里合法接触只有两种: 精确重合(0pt, \Chain 端子对接)或相距很远
+# (>24pt)。**没有"差一点点"的合法情况**, 所以区间里的都是真问题或起码要人看。
+NEAR_TOL = 2.0
+
+# ⚠ **只用这一个容差**。此前"悬空判定"另用了 1.2pt、而网表连通用 0.8pt,
+#   于是相差 0.5pt 的两个点: 网表判分离, 悬空检查却说"接上了" —— 两个标准,
+#   谁都说不清电路到底连没连。门禁互相矛盾比门禁太松更危险(你不知道信哪个)。
+#   现在 build_nets 的点-点对接与 check_tex_net 的悬空判定都用 TOL。
 
 
 def _num(v):
@@ -61,7 +71,7 @@ def parse_sidecar(path):
     out = {"wires": [], "dots": [], "terms": {}, "bodies": {},
            "powers": [], "tags": [], "expect": [], "annos": [], "canvas": None,
            "hint_h": [], "hint_v": [], "warns": [], "annoat": [], "names": [],
-           "gsyms": []}
+           "gsyms": [], "conflicts": []}
     bad = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for lineno, raw in enumerate(f, 1):
@@ -85,11 +95,22 @@ def parse_sidecar(path):
                     out["dots"].append((x, y))
                 elif kind == "T":
                     name, x, y = rest.split("|")
-                    out["terms"][name] = (_num(x), _num(y))
+                    pts = (_num(x), _num(y))
+                    # 同名端子重复登记: 静默覆盖会让**先出现的信息消失**
+                    # (两条记录只留最后一条), 而侧车里一条 = 一个电气端子,
+                    # 覆盖等于凭空少一个端子。同坐标的重复是良性的(同一端子
+                    # 被两条路径登记), 异坐标才是真冲突 —— 报出来。
+                    if name in out["terms"] and out["terms"][name] != pts:
+                        out["conflicts"].append(
+                            ("T", name, out["terms"][name], pts, lineno))
+                    out["terms"][name] = pts
                 elif kind == "B":
                     name, x0, y0, x1, y1 = rest.split("|")
-                    out["bodies"][name] = (_num(x0), _num(y0),
-                                           _num(x1), _num(y1))
+                    box = (_num(x0), _num(y0), _num(x1), _num(y1))
+                    if name in out["bodies"] and out["bodies"][name] != box:
+                        out["conflicts"].append(
+                            ("B", name, out["bodies"][name], box, lineno))
+                    out["bodies"][name] = box
                 elif kind == "P":
                     name, x, y = rest.split("|")
                     out["powers"].append((name, _num(x), _num(y)))
@@ -191,10 +212,13 @@ def is_degenerate(seg):
 # ================================================================
 def build_nets(sc):
     """
-    用并查集把侧车还原成网表。返回 (find, members, nets, aliases):
+    用并查集把侧车还原成网表。返回 (find, members, nets, wires, dots,
+    tag_pts, near_miss):
       find    并查集查找函数
       members {成员名: 并查集节点}   成员名形如 R1.a / Q1.c / +5V / GND / 标签1
       nets    {根: [成员名, ...]}
+      near_miss [(名a, 名b, 距离), ...]  相差 >TOL 但 <=NEAR_TOL 的点对 ——
+               **未连通**, 但检出来报("你以为接上了其实差一点")
     """
     wires = [w for w in sc["wires"]
              if is_orthogonal(w) and not is_degenerate(w)]
@@ -275,6 +299,27 @@ def build_nets(sc):
             if on_segment(x, y, *s):
                 union(k, ("seg", i))
 
+    # 端子与端子"直接对接"(中间不画线, 如 \Chain 相邻两节、电阻下端正好
+    # 落在电源符号接点上) —— 电气上就是连上了。
+    # **必须用与悬空判定相同的 TOL**。此前这里用坐标量化 key()(round 到
+    # 0.1pt), 而悬空判定用 1.2pt, 网表又用 0.8pt —— 三个标准。差 0.5pt 的
+    # 两个点会落成"网表判分离、悬空不报"的矛盾状态, 谁都不知道该信哪个。
+    # 现在统一: 端点两两距离 <= TOL 即连通, 且悬空检查用同一条规则。
+    pts = list(sc["terms"].items()) + \
+          [(f"电源{nm}", (x, y)) for nm, x, y in sc["powers"]]
+    near_miss = []
+    for i in range(len(pts)):
+        ni, (xi, yi) = pts[i]
+        for j in range(i + 1, len(pts)):
+            nj, (xj, yj) = pts[j]
+            d = max(abs(xi - xj), abs(yi - yj))
+            if d <= TOL:
+                union(key((xi, yi)), key((xj, yj)))
+            elif d <= NEAR_TOL:
+                # 差一点接上 —— 不算连通(不能放宽 TOL, 那会掩盖真断线),
+                # 但要报出来给人看。真图里合法接触非 0 即远, 没有"差一点"。
+                near_miss.append((ni, nj, d))
+
     # 分组
     nets = {}
     for name, node in members.items():
@@ -286,7 +331,7 @@ def build_nets(sc):
     for i in range(len(wires)):
         nets.setdefault(find(("seg", i)), [])
 
-    return find, members, nets, wires, dots, tag_pts
+    return find, members, nets, wires, dots, tag_pts, near_miss
 
 
 def net_of(find, members, name):

@@ -35,14 +35,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sidecar import (parse_sidecar, build_nets, net_of, on_segment,
+from sidecar import (parse_sidecar, build_nets, net_of,
                      is_orthogonal, seg_cross, fmt_pt, TOL)   # noqa: E402
 
 
 def analyze(net_path, quiet=False):
     """跑全部门禁, 返回结果 dict（供 check_tex_layout / 测试复用）。"""
     sc = parse_sidecar(net_path)
-    find, members, nets, wires, dots, tag_pts = build_nets(sc)
+    find, members, nets, wires, dots, tag_pts, near_miss = build_nets(sc)
 
     # ---- 斜线 ----
     slanted = [w for w in sc["wires"] if not is_orthogonal(w)]
@@ -156,19 +156,22 @@ def analyze(net_path, quiet=False):
     # 本方案里这结构上少见, 但 \Term 可以登记一个不画线的点 —— 留着当保险。
     #
     # **"没有导线"不等于"悬空"**: 两个端子直接对接(中间不画线, 如电阻下端
-    # 正好落在电源符号的接点上)在电气上就是连上了。这种
-    # "端子直接对接"(见其检查 4 的注释)。少了这条, 每种"元件直接坐在电源/
-    # 地上"的画法都会误报悬空。
-    others = list(sc["terms"].items()) + \
-             [(f"电源{nm}", (x, y)) for nm, x, y in sc["powers"]]
+    # 正好落在电源符号的接点上)在电气上就是连上了。这种"端子直接对接"由
+    # build_nets 里的点-点对接规则负责(见其注释)。
+    #
+    # ⚠ 判据**必须从网表来**, 不能另写一套几何距离: 此前这里另用了 1.2pt、
+    #   网表用 0.8pt, 于是相差 0.5pt 的两个点会出现"网表判分离、悬空不报" ——
+    #   两个门禁对同一件事给出矛盾结论, 而用户不知道该信哪个。现在统一:
+    #   端子的网里若既没有导线、又没有别的成员, 才算悬空。
+    wire_roots = {find(("seg", i)) for i in range(len(wires))}
     dangling = []
-    for name, (x, y) in sorted(sc["terms"].items()):
-        touch = sum(1 for s in wires if on_segment(x, y, *s))
-        if not touch:
-            touch = sum(1 for onm, (ox, oy) in others
-                        if onm != name and abs(ox - x) < 1.2 and abs(oy - y) < 1.2)
-        if not touch:
-            dangling.append((name, (x, y)))
+    for name in sorted(sc["terms"]):
+        r = net_of(find, members, name)
+        if r in wire_roots:
+            continue                       # 挂上了某条导线 -> 不悬空
+        if len(nets.get(r, [])) >= 2:
+            continue                       # 与别的端子/电源直接对接 -> 不悬空
+        dangling.append((name, sc["terms"][name]))
 
     res = {
         "n_wires": len(wires), "n_dots": len(dots),
@@ -185,6 +188,16 @@ def analyze(net_path, quiet=False):
         # 于是 \Wire 里失效的零长判断静默穿过了两道门 —— 漏检能穿过去, 不是
         # 因为没有检查, 而是因为**检查结果没人看**。
         "warns": sc.get("warns", []),
+        # 同名端子/本体盒的**异坐标**重复登记 —— 静默覆盖会凭空少一个电气
+        # 实体, 而图上看不出来(图照常画)。必须报。
+        "conflicts": sc.get("conflicts", []),
+        # 相差 >TOL 但 <=NEAR_TOL 的点对: **未连通**, 但几乎贴上 —— 图上看着
+        # 连了、电气上是断的, 正是要报的那类。
+        "near_miss": near_miss,
+        # 侧车是不是"什么都没记"。空侧车不代表电路干净, 代表**没检查过** ——
+        # 这是本项目最危险的失效模式("查了没问题"与"压根没看"长得一样)。
+        "empty": not (sc["wires"] or sc["terms"] or sc["bodies"]),
+        "n_annos": len(sc["annos"]),
     }
     return res
 
@@ -204,6 +217,24 @@ def report(path, r, show_nets=False):
         for ln, txt in r["unparsed"][:3]:
             print(f"           第{ln}行: {txt}")
         n += len(r["unparsed"])
+    if r.get("empty"):
+        # 空侧车 / 侧车里没有任何电气实体: **不是"电路干净", 是"没检查过"**。
+        # 必须报出来 —— 否则"漏跑编译"与"电路正确"在输出上完全一样。
+        print("  [空侧车] 侧车里没有任何导线/端子/本体 —— 这不是「电路干净」, "
+              "是**根本没检查到东西**。")
+        print("           → 确认 .tex 里用了 \\Wire/\\cPart 等会记账的宏, "
+              "且 \\DumpCanvas 在 \\end{tikzpicture} 之前;")
+        print("             或该 .net 是上一次失败编译留下的残片 —— "
+              "删掉重跑 build.py。")
+        n += 1
+    for kind, name, old, new, lineno in r.get("conflicts", []):
+        what = "端子" if kind == "T" else "本体盒"
+        print(f"  [重名] {what}「{name}」被登记了两次且位置不同 "
+              f"(第{lineno}行 {new} vs 先前 {old}) —— 后者会**静默覆盖**前者, "
+              f"等于凭空少一个电气实体。")
+        print(f"           → 两个不同器件用了同一个名字。改名(器件名必须 ASCII "
+              f"且唯一), 或确认它们本就该重合。")
+        n += 1
     if r["warns"]:
         # 记账警告: 画图时 TeX 侧发现的不合规事情。不参与连通性判定,
         # 但**必须报** —— 见 analyze() 里 "warns" 那段注释。
@@ -255,6 +286,12 @@ def report(path, r, show_nets=False):
     for name, pt in r["dangling"]:
         print(f"  [悬空] 端子 {name} @ {fmt_pt(*pt)} 没接到任何导线")
         n += 1
+    for na, nb, d in r.get("near_miss", []):
+        print(f"  [近接] {na} 与 {nb} 相距仅 {d:.2f}pt —— "
+              f"**未连通**(容差 {TOL}pt), 但图上看着贴住了。")
+        print(f"           → 电气上是断的。用 terminals()/命名坐标取准确位置"
+              f"让两端重合, 或补一条导线真正接上。")
+        n += 1
     for tname, want, actual, why in r["miswired"]:
         if actual is None:
             print(f"  [接错] {tname} 声明应与 {want} 同网, 但 {why}")
@@ -276,7 +313,6 @@ def report(path, r, show_nets=False):
               "无孤标签 / 无斜线")
     return n
 
-
 def main():
     ap = argparse.ArgumentParser(description="侧车网表连通性体检 (TikZ 路线)")
     ap.add_argument("files", nargs="+", help="侧车 .net 文件 (支持通配符)")
@@ -290,14 +326,26 @@ def main():
         paths.extend(got if got else [pat])
 
     total = 0
+    missing = 0
     for p in sorted(paths):
         if not os.path.exists(p):
-            print(f"跳过(不存在): {p}")
+            # **不能当成"跳过"** —— 路径写错、build 没产出、文件被删, 全都
+            # 走到这里。静默跳过等于"输入错也算通过", 与漏检同性质。
+            print(f"错误: 侧车不存在: {p}", file=sys.stderr)
+            missing += 1
+            continue
+        if os.path.getsize(p) == 0:
+            print(f"错误: 侧车是空文件: {p} "
+                  f"(没检查到任何东西, 不等于电路干净)", file=sys.stderr)
+            missing += 1
             continue
         r = analyze(p, quiet=True)
         total += report(p, r, show_nets=args.show_nets)
         print()
 
+    if missing:
+        print(f"===== {missing} 个侧车**根本没检查**(不存在或为空) =====", file=sys.stderr)
+        return 2
     print(f"===== 合计电气问题数: {total} =====")
     if total:
         print("必须修掉才能交付。")

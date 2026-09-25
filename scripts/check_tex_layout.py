@@ -218,7 +218,9 @@ def analyze(path, min_text_gap=MIN_TEXT_GAP, min_parallel=MIN_PARALLEL,
             "n_wires": len(wires),
             "n_annos": len(annos), "n_bodies": len(bodies),
             "canvas": canvas, "warns": sc.get("warns", []),
-            "unparsed": sc["unparsed"]}
+            "unparsed": sc["unparsed"],
+            # 侧车里没有任何可查对象 —— 不是"排版干净", 是**没东西可查**。
+            "empty": not (wires or annos or bodies or sc.get("gsyms"))}
 
 
 def _short(s, n=26):
@@ -235,6 +237,12 @@ def report(path, r, verbose=False):
         for ln, t in r["unparsed"][:3]:
             print(f"           第{ln}行: {t}")
         n += len(r["unparsed"])
+    if r.get("empty"):
+        print("  [空侧车] 侧车里没有导线/文字盒/器件盒 —— 这不是「排版干净」, "
+              "是**根本没检查到东西**。")
+        print("           → 确认 .tex 真的画了东西且 \\DumpCanvas 在 "
+              "\\end{tikzpicture} 之前; 或删掉这份残片重跑 build.py。")
+        n += 1
     for w in r["warns"]:
         print(f"  [记账] {w}")
         n += 1
@@ -359,9 +367,17 @@ def main():
         paths.extend(got if got else [pat])
 
     total = 0
+    missing = 0
     for p in sorted(paths):
         if not os.path.exists(p):
-            print(f"跳过(不存在): {p}")
+            # 同电气门: 路径错/没产出/被删都走这里, 静默跳过 = "输入错也算过"。
+            print(f"错误: 侧车不存在: {p}", file=sys.stderr)
+            missing += 1
+            continue
+        if os.path.getsize(p) == 0:
+            print(f"错误: 侧车是空文件: {p} "
+                  f"(没检查到任何东西, 不等于排版干净)", file=sys.stderr)
+            missing += 1
             continue
         r = analyze(p, min_text_gap=args.min_text_gap,
                     min_parallel=args.min_parallel,
@@ -369,6 +385,9 @@ def main():
         total += report(p, r)
         print()
 
+    if missing:
+        print(f"===== {missing} 个侧车**根本没检查**(不存在或为空) =====", file=sys.stderr)
+        return 2
     print(f"===== 合计排版问题数: {total} =====")
     if total:
         print("建议修掉再交付(文字重叠/压线会让图读错)。")

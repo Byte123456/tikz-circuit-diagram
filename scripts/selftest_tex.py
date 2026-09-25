@@ -25,6 +25,10 @@ import _paths                        # noqa: E402   (定位 assets/ 下的 sty)
 
 FAIL = []
 PASS = []
+# **跳过 ≠ 通过**。此前没有 xelatex 的机器上, 9 个 TeX 用例被 append 进 PASS,
+# 最后打印"32/32 全部通过" —— 而实际只跑了 23 个。这正是本文件开头说的那类
+# 失效: "查了没问题"和"压根没查"在输出上长得一样。现在分账统计。
+SKIP = []
 
 
 def sidecar(text):
@@ -387,7 +391,135 @@ B|R1|-5|-38|5|-10
 
 
 # =====================================================================
-#  13. 端到端: TeX 侧必须真的把记账写出来
+#  14. 重名登记: 同名端子/本体盒**异坐标**重复必须报(静默覆盖=少一个实体)
+# =====================================================================
+# 侧车里一条 T| = 一个电气端子。同名异坐标的重复登记此前只留最后一条,
+# 前一条凭空消失, 而图照常画 —— 检查器"看少了"却报 0。
+def expect_conflict(name, side_text, want_kind, want_substr=None):
+    """断言侧车解析报出了 conflicts。"""
+    path = sidecar(side_text)
+    r = N.analyze(path, quiet=True)
+    got = r.get("conflicts", [])
+    hit = any(k == want_kind for k, *_ in got)
+    if hit and (want_substr is None
+                or any(want_substr == nm for _, nm, *_ in got)):
+        PASS.append(name)
+    else:
+        FAIL.append(f"{name}: 期望 conflicts 含 {want_kind}/{want_substr}, "
+                    f"实际 {got}")
+    os.unlink(path)
+
+
+expect_conflict("重名: 端子同名异坐标被报出", """
+T|R1.a|0|0
+T|R1.a|200|200
+""", "T", "R1.a")
+
+expect_conflict("重名: 本体盒同名异坐标被报出", """
+T|R1.a|0|0
+B|R1|0|0|10|10
+B|R1|100|100|110|110
+""", "B", "R1")
+
+# 同坐标重复是**良性**的: 同一端子被两条路径登记(如 \Term 与 \SNregTwo 都
+# 碰了它)。这种不能报, 否则真图会满屏假问题。
+path = sidecar("""
+T|R1.a|10|10
+T|R1.a|10|10
+B|R1|0|0|20|20
+B|R1|0|0|20|20
+""")
+r = N.analyze(path, quiet=True)
+if not r.get("conflicts"):
+    PASS.append("重名: 同坐标重复登记不报(防误报)")
+else:
+    FAIL.append(f"重名: 同坐标重复不该报, 实际 {r['conflicts']}")
+os.unlink(path)
+
+
+# =====================================================================
+#  15. 近接: 相差 >TOL 但 <=NEAR_TOL 的点对必须报("看着贴住其实断了")
+# =====================================================================
+# 这条同时护住"容差一致": 两个点要么连通、要么不连通, 不能出现"网表说
+# 分开、悬空说接上了"的矛盾。
+def expect_near(name, side_text, want_hit=True):
+    path = sidecar(side_text)
+    r = N.analyze(path, quiet=True)
+    hit = bool(r.get("near_miss"))
+    if hit == want_hit:
+        PASS.append(name)
+    else:
+        FAIL.append(f"{name}: 期望 near_miss={want_hit}, 实际 {r.get('near_miss')}")
+    os.unlink(path)
+
+
+expect_near("近接: 相差 1.2pt 的两端子被报出(且未连通)", """
+T|R1.a|100|100
+T|R2.a|101.2|100
+""")
+expect_near("近接: 精确重合的两端子不报(是连通的)", """
+T|R1.a|100|100
+T|R2.a|100|100
+""", want_hit=False)
+expect_near("近接: 相距很远的端子不报", """
+T|R1.a|100|100
+T|R2.a|100|300
+""", want_hit=False)
+
+
+# 容差一致性: 相差 <=TOL 的两端子必须**连通**(网表)且**不报悬空** ——
+# 同一件事只能有一个结论。此前网表 TOL=0.8、悬空判定 1.2, 差 0.5pt 的点
+# 会落进"网表判分离、悬空不报"的矛盾区。
+expect_only_nets("容差一致: 相差 0.5pt 的两端子判连通", """
+T|R1.a|100|100
+T|R2.a|100|100.5
+""", want_same=[("R1.a", "R2.a")])
+
+path = sidecar("""
+T|R1.a|100|100
+T|R2.a|100|100.5
+""")
+r = N.analyze(path, quiet=True)
+if r["dangling"]:
+    FAIL.append(f"容差一致: 已判连通却报悬空 —— {r['dangling']}")
+else:
+    PASS.append("容差一致: 已判连通的端子不报悬空(无矛盾)")
+os.unlink(path)
+
+
+# =====================================================================
+#  16. 空侧车: 必须报"没检查到东西", 而不是"干净"
+# =====================================================================
+# 空侧车 / 侧车里没有电气实体时, 若报"电气干净", 那么"漏跑编译"与"电路
+# 正确"在输出上完全一样 —— 本文件开头点名的那个失效模式。
+path = sidecar("")
+r = N.analyze(path, quiet=True)
+if r.get("empty"):
+    PASS.append("空侧车: 电气门标记 empty(不当成干净)")
+else:
+    FAIL.append("空侧车: 电气门没标记 empty")
+os.unlink(path)
+
+path = sidecar("")
+r = L.analyze(path)
+if r.get("empty"):
+    PASS.append("空侧车: 排版门标记 empty(不当成干净)")
+else:
+    FAIL.append("空侧车: 排版门没标记 empty")
+os.unlink(path)
+
+# 有实体的侧车不能被误标 empty
+path = sidecar("P|+5V|0|0\nW|0|0|10|0\nT|R1.a|10|0\n")
+r = N.analyze(path, quiet=True)
+if not r.get("empty"):
+    PASS.append("空侧车: 有实体的侧车不误标 empty")
+else:
+    FAIL.append("空侧车: 有实体的侧车被误标 empty")
+os.unlink(path)
+
+
+# =====================================================================
+#  17. 端到端: TeX 侧必须真的把记账写出来
 # =====================================================================
 # 上面全是"喂合成侧车给检查器"的单元测试 —— 它们护不住 **TeX 侧宏**的
 # 记账是否真的发生。而最危险的一类失效恰好在那儿: 宏静默跳过, 侧车里
@@ -403,7 +535,7 @@ def expect_tex_logging(name, tex_body, want_counts):
     import subprocess
     xelatex = _paths.find_xelatex()          # 统一走 _paths, 不写死用户目录
     if not xelatex:
-        PASS.append(f"{name}（跳过: 本机没有 xelatex）")
+        SKIP.append(f"{name}（本机没有 xelatex）")
         return
     tmp = tempfile.mkdtemp(prefix="sntex_")
     tex = os.path.join(tmp, "probe.tex")
@@ -521,7 +653,7 @@ def expect_mcu_pins(name, tex_body, n_pins, want_pitch_cm):
     import subprocess
     xelatex = shutil.which("xelatex")
     if not xelatex:
-        PASS.append(f"{name}（跳过: 本机没有 xelatex）")
+        SKIP.append(f"{name}（本机没有 xelatex）")
         return
     tmp = tempfile.mkdtemp(prefix="snmcu_")
     with open(os.path.join(tmp, "probe.tex"), "w", encoding="utf-8") as f:
@@ -592,7 +724,7 @@ def expect_axis(name, tex_body, want):
     import subprocess
     xelatex = shutil.which("xelatex")
     if not xelatex:
-        PASS.append(f"{name}（跳过: 本机没有 xelatex）")
+        SKIP.append(f"{name}（本机没有 xelatex）")
         return
     tmp = tempfile.mkdtemp(prefix="snaxis_")
     with open(os.path.join(tmp, "probe.tex"), "w", encoding="utf-8") as f:
@@ -652,7 +784,7 @@ def expect_pack(name, tex_body):
     import subprocess as _sp
     xelatex = _sh.which("xelatex")
     if not xelatex:
-        PASS.append(f"{name}（跳过: 本机没有 xelatex）")
+        SKIP.append(f"{name}（本机没有 xelatex）")
         return
     here = os.path.dirname(os.path.abspath(__file__))
     tmp = tempfile.mkdtemp(prefix="snpack_")
@@ -724,14 +856,28 @@ expect_pack("TeX: \\AnnoPack 同列两块自动分开", r"""
 
 
 def main():
-    print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}\n")
+    total = len(PASS) + len(FAIL) + len(SKIP)
+    print(f"通过 {len(PASS)} / 失败 {len(FAIL)} / 跳过 {len(SKIP)} "
+          f"(共 {total})\n")
     for p in PASS:
         print(f"  ok   {p}")
+    for s in SKIP:
+        print(f"  skip {s}")
     if FAIL:
         print()
         for f in FAIL:
             print(f"  FAIL {f}")
         print(f"\n===== {len(FAIL)} 个用例失败 =====")
+        return 1
+    if SKIP:
+        # **有跳过就不报"全部通过"** —— 被跳过的用例正是 TeX 侧那些(记账条数、
+        # 宏静默失效), 它们"没跑过"和"跑过且通过"完全不是一回事。CI 里应当
+        # 装好 TeX 让 SKIP=0; 本机缺工具链时明确告知还差多少用例没验。
+        print(f"\n===== {len(PASS)} 个通过, 但 {len(SKIP)} 个**跳过未验** =====")
+        print("跳过的多是 TeX 端到端用例(需要 xelatex)。它们护的是"
+              "\"宏静默失效\"这类最危险的漏检,")
+        print("**不能当成通过**。装好 MiKTeX/TeX Live(含 ctex) 后重跑, "
+              "SKIP 应为 0。")
         return 1
     print("\n===== 全部通过 =====")
     print("检查器能抓: 短路 / 旁路 / 穿体 / 悬空 / 接错 / 孤标签 / 非正交,")
