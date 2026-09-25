@@ -189,7 +189,7 @@ def measure(net, origins):
     """
     sc = parse_sidecar(net)
     out = {}
-    for name, bb in sc["bodies"].items():
+    for name, bb in sc["bodies"]:
         if name not in origins:
             continue
         bx, by = origins[name]

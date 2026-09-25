@@ -391,7 +391,7 @@ B|R1|-5|-38|5|-10
 
 
 # =====================================================================
-#  14. 重名登记: 同名端子/本体盒**异坐标**重复必须报(静默覆盖=少一个实体)
+#  14. 重名登记: 同名端子**异坐标**必须报; 同名本体盒(多部件)合法保留
 # =====================================================================
 # 侧车里一条 T| = 一个电气端子。同名异坐标的重复登记此前只留最后一条,
 # 前一条凭空消失, 而图照常画 —— 检查器"看少了"却报 0。
@@ -415,11 +415,25 @@ T|R1.a|0|0
 T|R1.a|200|200
 """, "T", "R1.a")
 
-expect_conflict("重名: 本体盒同名异坐标被报出", """
-T|R1.a|0|0
-B|R1|0|0|10|10
-B|R1|100|100|110|110
-""", "B", "R1")
+# 本体盒**同名多条是合法的**: 同一继电器的线圈(\CoilNode)与触点(\Contacts)
+# 都以器件名为参数, 坐标本就不同。早期实现把 B| 存成按名覆盖的 dict, 于是
+# 触点把线圈的盒**顶掉**, 排版门看不到被覆盖的那个(器件重叠/越界/压字都漏
+# 检)。这里断言两点: (a) 不产生假冲突; (b) 两条盒都保留下来。
+path = sidecar("""
+T|K1.t|0|0
+B|K1|-15|-15|15|15
+T|K1.com|40|0
+B|K1|40|-10|60|-20
+""")
+sc = N.parse_sidecar(path)
+r = N.analyze(path, quiet=True)
+if r.get("conflicts"):
+    FAIL.append(f"重名: 线圈+触点同名不该报冲突, 实际 {r['conflicts']}")
+elif len(sc["bodies"]) != 2:
+    FAIL.append(f"重名: 同名两个本体盒应都保留, 实际 {sc['bodies']}")
+else:
+    PASS.append("重名: 同器件多部件(线圈+触点)同名不报, 且两个盒都保留")
+os.unlink(path)
 
 # 同坐标重复是**良性**的: 同一端子被两条路径登记(如 \Term 与 \SNregTwo 都
 # 碰了它)。这种不能报, 否则真图会满屏假问题。
@@ -515,6 +529,157 @@ if not r.get("empty"):
     PASS.append("空侧车: 有实体的侧车不误标 empty")
 else:
     FAIL.append("空侧车: 有实体的侧车被误标 empty")
+os.unlink(path)
+
+
+# =====================================================================
+#  16.5 审计后补的回归(外部审查发现的漏检/误报)
+# =====================================================================
+
+# --- (a) 端子挂在导线上、且该导线没有别的成员 -> 不悬空 ---
+# 这是 dangling 的 `wire_roots` 分支。审计实测: 把它整个禁用, 43 个用例
+# 照样全绿 —— 说明**没有任何用例**覆盖它。原因是别处涉及导线的用例里,
+# 导线另一端都还挂着电源/标签, 于是被 `nets>=2` 兜住了, 永远走不到这里。
+# 这个拓扑是唯一依赖它的(端子是那条导线的唯一成员)。
+path = sidecar("W|0|0|100|0\nT|R1.a|50|0\n")
+r = N.analyze(path, quiet=True)
+if r["dangling"]:
+    FAIL.append(f"悬空: 端子挂在**无其他成员**的导线上不该报悬空 —— "
+                f"{r['dangling']}")
+else:
+    PASS.append("悬空: 端子挂在无其他成员的导线上不报悬空(护 wire_roots 分支)")
+os.unlink(path)
+
+# 对照: 端子离导线很远 -> 仍应报悬空(防"把这条分支改宽成永不报")
+path = sidecar("W|0|0|100|0\nT|R1.a|50|40\n")
+r = N.analyze(path, quiet=True)
+if r["dangling"]:
+    PASS.append("悬空: 端子离导线远仍报悬空(对照)")
+else:
+    FAIL.append("悬空: 端子离导线远却没报悬空")
+os.unlink(path)
+
+
+# --- (b) 电源/地命名表: 5V/3V3/VBUS 与 GND 短路必须报 ---
+# 审计实测: 早期只认 VCC/VDD/+ 开头, 于是 `5V`-`GND` 的**死短路**报"干净",
+# 而示例图恰好用 +3.3V/+5V(带 +), 全绿掩盖了这条边界。
+def expect_short(name, side_text, want_hit=True):
+    path = sidecar(side_text)
+    r = N.analyze(path, quiet=True)
+    hit = bool(r["shorted"])
+    if hit == want_hit:
+        PASS.append(name)
+    else:
+        FAIL.append(f"{name}: 期望 shorted={want_hit}, 实际 {r['shorted']}")
+    os.unlink(path)
+
+
+# 一根导线直接连 5V 与 GND —— 死短路
+expect_short("短路: 5V 与 GND 同网被报出(命令名不在旧表里)", """
+W|0|0|50|0
+P|5V|0|0
+P|GND|50|0
+""")
+expect_short("短路: 3V3 与 GND 同网被报出", """
+W|0|0|50|0
+P|3V3|0|0
+P|GND|50|0
+""")
+expect_short("短路: VBUS 与 GND 同网被报出", """
+W|0|0|50|0
+P|VBUS|0|0
+P|GND|50|0
+""")
+expect_short("短路: VIN 与 AGND(另一种地)同网被报出", """
+W|0|0|50|0
+P|VIN|0|0
+P|AGND|50|0
+""")
+expect_short("短路: 两条电源(5V/3V3)被接在一起也报", """
+W|0|0|50|0
+P|5V|0|0
+P|3V3|50|0
+""")
+expect_short("短路: +5V(VSS 另一种地)同网被报出", """
+W|0|0|50|0
+P|+5V|0|0
+P|VSS|50|0
+""")
+# 防误报: 名字里带 V 但**不是**电源轨的, 不能报
+expect_short("短路: 5V 与 GND **不同网**时不报(防误报)", """
+P|5V|0|0
+P|GND|50|0
+T|R1.a|0|0
+T|R1.b|50|0
+""", want_hit=False)
+expect_short("短路: +5V 与 GND 不同网不报(原有行为不退化)", """
+P|+5V|0|0
+P|GND|50|0
+V|SENSE_1|80|0
+""", want_hit=False)
+
+
+# --- (c) 缺 C| 时"器件越界"必须报"没查成", 不能静默当作通过 ---
+def expect_layout_flag(name, side_text, flag):
+    path = sidecar(side_text)
+    r = L.analyze(path)
+    if r.get(flag):
+        PASS.append(name)
+    else:
+        FAIL.append(f"{name}: 期望 {flag} 为真, 实际 {r.get(flag)}")
+    os.unlink(path)
+
+
+expect_layout_flag("无画布: 有器件盒但无 C| 时标记 no_canvas", """
+B|R1|200|200|220|220
+P|GND|200|220
+""", "no_canvas")
+
+# 有 C| 时不该标(不能变成"永远报")
+path = sidecar("""
+C|0|0|300|300
+B|R1|10|10|30|30
+""")
+r = L.analyze(path)
+if r.get("no_canvas"):
+    FAIL.append("无画布: 有 C| 时不该标 no_canvas, 实际标了")
+else:
+    PASS.append("无画布: 有 C| 时不标记 no_canvas(防误报)")
+os.unlink(path)
+
+# --- (d) 容器框(K|): 参与重叠/越界, 但不参与"文字压器件" ---
+# MCU 方块这类容器, 引脚名本来就写在方块里。若按本体盒判, 每个引脚误报
+# 一次(实测 2 引脚 MCU 立刻报 3 处)。用 K| 区分开后: 里面塞器件要报,
+# 引脚名不报。
+# 注意夹具要让两件事**分别可判**: 文字在容器内但**不在任何真实本体盒内**,
+# 而器件 R9 与容器相交。
+path = sidecar("""
+K|MCU|-50|-40|50|40
+X|1|A|-10|20|10|30|PA0
+B|R9|-5|-5|5|5
+""")
+r = L.analyze(path)
+has_ov = len(r["comp_overlaps"]) >= 1
+has_txt = len(r["text_on_body"]) >= 1
+if has_ov and not has_txt:
+    PASS.append("容器: 器件落进容器报重叠, 但容器内文字不报压器件")
+elif not has_ov:
+    FAIL.append("容器: 器件落在容器里却没报重叠")
+else:
+    FAIL.append(f"容器: 容器内文字被误报压器件 {r['text_on_body']}")
+os.unlink(path)
+
+# 对照: 文字压在**真实本体盒**上仍必须报(别把容器规则用过头)
+path = sidecar("""
+K|MCU|-50|-40|50|40
+X|1|A|-5|-5|5|5|压在R9上
+B|R9|-10|-10|10|10
+""")
+r = L.analyze(path)
+if r["text_on_body"]:
+    PASS.append("容器: 文字压在真实本体盒上仍报压器件(对照)")
+else:
+    FAIL.append("容器: 文字压在真实本体盒上没报 —— 容器规则用过头了")
 os.unlink(path)
 
 

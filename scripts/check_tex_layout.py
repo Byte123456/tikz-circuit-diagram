@@ -107,7 +107,11 @@ def analyze(path, min_text_gap=MIN_TEXT_GAP, min_parallel=MIN_PARALLEL,
     # 判据用面积: 宽 <0.5pt 或高 <0.5pt 的都当"没有字"。
     annos = [a for a in sc["annos"]
              if abs(a[2] - a[0]) >= 0.5 and abs(a[3] - a[1]) >= 0.5]
-    bodies = list(sc["bodies"].items())
+    # 器件本体盒 + 容器框一起参与"越界/重叠"(都占版面);
+    # 但"文字压器件"**只看本体盒** —— 容器(MCU 方块)里本来就写字(引脚名),
+    # 按本体盒判会每个引脚误报一次。见 \ContainerBox 的注释。
+    real_bodies = list(sc["bodies"])
+    bodies = real_bodies + list(sc.get("containers", []))
 
     # ---- 1. 文字重叠 ----
     text_overlaps = []
@@ -142,8 +146,12 @@ def analyze(path, min_text_gap=MIN_TEXT_GAP, min_parallel=MIN_PARALLEL,
                 too_close.append((wires[i], wires[j], dist, axis, span))
 
     # ---- 4. 器件越界 ----
+    # 没有 C| 记录时**不能沉默**: \DumpCanvas 是手工调用的宏, 漏写就没有画布。
+    # 此时"器件越界"整类检查无从进行, 报告里却照样打"无器件越界" —— 与"真的
+    # 没越界"完全不可分。改成明确报告"这项没查成"(no_canvas), 计入问题数。
     out_of_canvas = []
     canvas = sc["canvas"]
+    no_canvas = canvas is None and bool(bodies)
     if canvas:
         cx0, cy0, cx1, cy1 = _box(canvas)
         for name, b in bodies:
@@ -186,7 +194,7 @@ def analyze(path, min_text_gap=MIN_TEXT_GAP, min_parallel=MIN_PARALLEL,
     for a in annos:
         cx = (a[0] + a[2]) / 2.0
         cy = (a[1] + a[3]) / 2.0
-        for name, bb in bodies:
+        for name, bb in real_bodies:
             bx0, by0, bx1, by1 = _box(bb)
             if (bx0 + 0.5 <= cx <= bx1 - 0.5
                     and by0 + 0.5 <= cy <= by1 - 0.5):
@@ -219,8 +227,12 @@ def analyze(path, min_text_gap=MIN_TEXT_GAP, min_parallel=MIN_PARALLEL,
             "n_annos": len(annos), "n_bodies": len(bodies),
             "canvas": canvas, "warns": sc.get("warns", []),
             "unparsed": sc["unparsed"],
+            # 侧车里没有 C| 却又有器件盒: "器件越界"这一整类**没法查**。
+            # 不能和"真的没越界"混为一谈。
+            "no_canvas": no_canvas,
             # 侧车里没有任何可查对象 —— 不是"排版干净", 是**没东西可查**。
-            "empty": not (wires or annos or bodies or sc.get("gsyms"))}
+            "empty": not (wires or annos or bodies or sc.get("gsyms")),
+            "n_containers": len(sc.get("containers", []))}
 
 
 def _short(s, n=26):
@@ -242,6 +254,13 @@ def report(path, r, verbose=False):
               "是**根本没检查到东西**。")
         print("           → 确认 .tex 真的画了东西且 \\DumpCanvas 在 "
               "\\end{tikzpicture} 之前; 或删掉这份残片重跑 build.py。")
+        n += 1
+    if r.get("no_canvas"):
+        # 有器件盒但没有 C|(画布): "器件越界"整类查不了。别让它静默通过。
+        print("  [无画布] 侧车里有器件盒但没有 C| 记录 —— **「器件越界」"
+              "这一类没查成**。")
+        print("           → 多半是 \\DumpCanvas 漏写或写在了 "
+              "\\end{tikzpicture} 之后。它必须在之前。")
         n += 1
     for w in r["warns"]:
         print(f"  [记账] {w}")

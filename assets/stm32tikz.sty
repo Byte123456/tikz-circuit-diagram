@@ -287,6 +287,22 @@
   \SNwrite{B|#1|\bax|\bay|\bbx|\bby}%
 }
 
+% ---- \ContainerBox{名}{角1}{角2}: 登记**容器框**(MCU 方块这类) -----
+% 与 \BodyBox 的区别只在**语义**, 用来让检查器区别对待:
+%   * 容器**参与**「器件重叠」「器件越界」—— 别的器件整块掉进 MCU 里、
+%     或 MCU 超出画布, 都该报;
+%   * 容器**不参与**「文字压器件」—— 引脚名、块名这类文字**本来就写在
+%     方块里**(标准画法), 按本体盒判会每个引脚都误报一次(实测: 2 引脚
+%     的 MCU 立刻报 3 处"文字压器件");
+%   * 容器**不参与**电气门的「穿体」—— MCU 不是"会被旁路"的元件,
+%     导线连到引脚上、在方块附近走线都是正常的。
+\newcommand\ContainerBox[3]{%
+  \SNresolveTo{#2}{\bax}{\bay}%
+  \SNresolveTo{#3}{\bbx}{\bby}%
+  \global\advance\snbodies by 1
+  \SNwrite{K|#1|\bax|\bay|\bbx|\bby}%
+}
+
 % ---- \DumpCanvas: 登记画布范围 ---------------------------------
 % 在 \end{tikzpicture} **之前**调用一次。排版门的"器件越界"需要它 ——
 % 从 TikZ 的 current bounding box 读 —— 这是**排版时**的真实范围,
@@ -706,6 +722,12 @@
   \coordinate (#1se) at ($(#1c)+(#4/2,-#5/2)$);%
   \coordinate (#1nw) at ($(#1c)+(-#4/2,#5/2)$);%
   \draw[wire] (#1nw) rectangle (#1se);%
+  % ⚠ 方块本体**必须登记** —— 否则它对排版门完全不可见: 标注压在方块上、
+  %   器件整个落进方块里、方块超出画布, 三类都查不出(实测过的盲区, 与电源/
+  %   地符号只记连接点同源: 画出来的图形不在侧车里)。
+  %   用 \ContainerBox 而非 \BodyBox: 引脚名/块名本来就写在方块内, 按本体盒
+  %   判"文字压器件"会把每个引脚都误报一次。
+  \ContainerBox{#1}{#1nw}{#1se}%
   \node[annb, font=\small\bfseries] at ($(#1c)+(0,#5/2+0.40cm)$) {#1};%
   \node[ann, font=\footnotesize] at ($(#1c)+(0,-#5/2-0.34cm)$) {#6};%
   \foreach \pname/\pdy in {#7}{%
@@ -750,8 +772,9 @@
   \coordinate (#1se) at ($(#1c)+(#4/2,-#5/2)$);%
   \coordinate (#1nw) at ($(#1c)+(-#4/2,#5/2)$);%
   \draw[wire] (#1nw) rectangle (#1se);%
-  \node[annb, font=\small\bfseries] at ($(#1c)+(0,#5/2+0.40cm)$) {#1};%
-  \node[ann, font=\footnotesize] at ($(#1c)+(0,-#5/2-0.34cm)$) {#6};%
+  \ContainerBox{#1}{#1nw}{#1se}%  与 \MCU 同理: 不登记则排版门看不见方块;
+  %                                且引脚名写在方块内, 故用容器框不用本体盒
+  \node[annb, font=\small\bfseries] at ($(#1c)+(0,#5/2+0.40cm)$) {#1};%  \node[ann, font=\footnotesize] at ($(#1c)+(0,-#5/2-0.34cm)$) {#6};%
   % 先把间距与引脚数定下来
   \snpitch=#7\relax
   \snnum=0

@@ -155,6 +155,20 @@ def solve(net_path, out_path, pins=None, report=False):
     wires = [w for w in sc["wires"] if is_orthogonal(w)]
     annos = sc["annoat"]
 
+    # 侧车解析失败 / 端子重名: 这两类会让**数据无声减少**, 而 place.py 此前
+    # 一个都不读。畸形 A| 行意味着对应标注从解算中整个消失(没有偏移、没有
+    # 告警), 报告却说"全部干净" —— 与"压根没有这个标注"完全不可分。
+    if sc["unparsed"]:
+        print(f"== {net_path}: ⚠ {len(sc['unparsed'])} 行侧车无法解析, "
+              f"相关标注会**从解算中消失**:", file=sys.stderr)
+        for ln, txt in sc["unparsed"][:5]:
+            print(f"     第{ln}行: {txt}", file=sys.stderr)
+    if sc.get("conflicts"):
+        print(f"== {net_path}: ⚠ {len(sc['conflicts'])} 处端子重名"
+              f"(同名端子落在不同点) —— 网表会少端子:", file=sys.stderr)
+        for kind, name, old, new, ln in sc["conflicts"][:5]:
+            print(f"     {name}: 第{ln}行 {new} vs 先前 {old}", file=sys.stderr)
+
     if not annos:
         print(f"== {net_path}: 侧车里没有 A| 记录。")
         print(r"   → 说明这张图用的是 \Anno 而不是 \AnnoAt —— 它的偏移是手写的,")
@@ -162,10 +176,18 @@ def solve(net_path, out_path, pins=None, report=False):
               r"\AnnoAt{键}{样式}{锚点}{角次序}{文字}。")
         return 0
 
-    # 钉死的键: 偏移由 --pin 给定, 当固定障碍物, 不参与解算
+    # 钉死的键: 偏移由 --pin 给定, 当固定障碍物, 不参与解算。
+    # **但必须照样写进 auto_offsets.tex** —— `--pin` 的语义就是"用这个偏移",
+    # 不写等于什么都没做, 而报告里还打着"钉死/全部干净"(实测过的哑巴失效:
+    # 偏移没生效, 却和成功一模一样)。所以这里就把偏移填进 _ox/_oy。
     fixed, todo = [], []
     for a in annos:
-        (fixed if a["key"] in pins else todo).append(a)
+        if a["key"] in pins:
+            a["_ox"], a["_oy"] = pins[a["key"]]
+            a["_corner"] = "钉死"
+            fixed.append(a)
+        else:
+            todo.append(a)
 
     # **手写标注(\Anno)当固定障碍物**: 它们没有 A| 记录, 位置是作者钉死的
     # (页脚说明块这类)。不把它们算进障碍, 自动摆位会把别的标注叠上去。
@@ -175,7 +197,7 @@ def solve(net_path, out_path, pins=None, report=False):
               if a[6] not in auto_ns
               and abs(a[2] - a[0]) >= 0.5 and abs(a[3] - a[1]) >= 0.5]
 
-    obstacles = ([(b, "body") for b in sc["bodies"].values()]
+    obstacles = ([(b, "body") for _, b in sc["bodies"] + sc.get("containers", [])]
                  + [(w, "wire") for w in wires]
                  # 电源/地符号的**图形范围**也要当障碍 —— 只躲连接点是不够的,
                  # 符号本体(地符号的横杠、VCC 的箭头)照样会被字压住。
@@ -197,7 +219,7 @@ def solve(net_path, out_path, pins=None, report=False):
     if report:
         for a in fixed:
             box = _box_at(a, *pins[a["key"]])
-            ob = ([(b, "body") for b in sc["bodies"].values()]
+            ob = ([(b, "body") for _, b in sc["bodies"] + sc.get("containers", [])]
                   + [(w, "wire") for w in wires])
             p = _penalty(box, ob)
             if p > 0:
@@ -320,10 +342,10 @@ def solve(net_path, out_path, pins=None, report=False):
             n_dirty += len(members)
 
     # 写偏移时 PACK 块要一起写(它们不在 todo 里了, 但同样需要 auto_offsets.tex
-    # 里的 snao<键> 才生效)。
-    all_solved = sorted(packed + todo, key=lambda a: int(a["n"]))
+    # 里的 snao<键> 才生效); **钉死的块也要写** —— 否则 --pin 静默失效。
+    all_solved = sorted(packed + todo + fixed, key=lambda a: int(a["n"]))
     _write(out_path, net_path, all_solved, warn)
-    _report(all_solved, packed, fixed, net_path, n_dirty, out_path, report)
+    _report(all_solved, packed, fixed, net_path, n_dirty, out_path, report, warn)
     return 1 if n_dirty else 0
 
 
@@ -349,7 +371,7 @@ def _write(out_path, net_path, todo, warn):
         f.write("\n".join(lines))
 
 
-def _report(todo, packed, fixed, net_path, n_dirty, out_path, verbose):
+def _report(todo, packed, fixed, net_path, n_dirty, out_path, verbose, warn=()):
     if verbose or n_dirty:
         n_pack = len(packed)
         n_pos = len(todo) - n_pack
@@ -370,6 +392,12 @@ def _report(todo, packed, fixed, net_path, n_dirty, out_path, verbose):
     else:
         msg += "   全部干净"
     print(msg)
+    # 警告**必须上 stderr**, 不能只写进生成文件的注释里 —— build.py 只捕获
+    # stdout, 从不读那个文件, 于是"角次序名拼错"(纯字符串, TeX 不报错)这类
+    # 问题此前完全没有用户可见的出口。侧车解析失败(畸形 A| 行)同理: 标注会
+    # 无声地从解算中消失, 而报告说"全部干净"。
+    for w in warn:
+        print(f"  ⚠ {w}", file=sys.stderr)
 
 
 def baseline_sorted(xs):

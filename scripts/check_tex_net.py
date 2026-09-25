@@ -32,11 +32,41 @@ r"""
 import argparse
 import glob
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sidecar import (parse_sidecar, build_nets, net_of,
                      is_orthogonal, seg_cross, fmt_pt, TOL)   # noqa: E402
+
+
+# ---- 电源/地的识别 ----------------------------------------------------
+# 为什么需要一张**较宽**的表: 短路是"一上电就烧"的最高危缺陷, 而早期实现只把
+# `VCC`/`VDD`/`+` 开头当作电源、只把精确的 `GND` 当作地。真实工程里
+# `5V`/`3V3`/`VBUS`/`VIN`(以及 `VSS`/`GNDA`/`AGND` 这类地)极常见, 它们与地
+# 短路时**一律漏检**(实测: `5V`-`GND` 死短路报"干净", 换成 `+5V` 才报)。
+#
+# 宁可宽一点: 把某个网络名误判成"电源"的代价是**多报一条待核**; 漏判的代价
+# 是**放过一个死短路**。前者可接受, 后者不可接受。
+_RAIL_RE = re.compile(
+    r"^(?:\+.*"                                   # +5V / +3.3V / +12V
+    r"|P?\d+(?:[._]?\d+)?V\d*$"                   # 5V / 3V3 / 5V0 / 3.3V / P3V3
+    r"|V(?:CC|DD|BUS|IN|BAT|SYS|DDA|REF|DDIO|CCIO)$"
+    r"|VBAT$|VUSB$)$",
+    re.IGNORECASE)
+_GROUND_RE = re.compile(
+    r"^(?:GND[A-Z0-9_]*|AGND|DGND|VSS[A-Z0-9]*|0V|EARTH|GNDD|.*_GND)$",
+    re.IGNORECASE)
+
+
+def is_rail(name):
+    """这个网络名看着像**电源轨**吗(VCC/VDD/VBUS/5V/3V3/+xV...)?"""
+    return bool(_RAIL_RE.match(name.strip()))
+
+
+def is_ground(name):
+    """这个网络名看着像**地**吗(GND/VSS/GNDA/AGND...)? """
+    return bool(_GROUND_RE.match(name.strip()))
 
 
 def analyze(net_path, quiet=False):
@@ -53,17 +83,29 @@ def analyze(net_path, quiet=False):
     bad_h = [(s, abs(s[1] - s[3])) for s in sc["hint_h"] if abs(s[1] - s[3]) > 0.5]
     bad_v = [(s, abs(s[0] - s[2])) for s in sc["hint_v"] if abs(s[0] - s[2]) > 0.5]
 
-    # ---- 检查 1: 电源与地同网 ----
-    vcc_roots = {}
+    # ---- 检查 1: 电源/地短路 ----
+    # 三类都报: 电源-地(VCC/GND)、电源-电源(5V/3V3)、地-地(GND/AGND)。
+    # 用 NetTag 连起来的**同名**网络已合并成一张网, 所以"同网"就是真短路。
+    rails, grounds = {}, {}
     for name in members:
-        up = name.upper()
-        if up in ("VCC", "VDD") or name.startswith("+"):
-            vcc_roots[name] = net_of(find, members, name)
-    r_gnd = net_of(find, members, "GND")
+        if is_rail(name):
+            rails[name] = net_of(find, members, name)
+        elif is_ground(name):
+            grounds[name] = net_of(find, members, name)
     shorted = []
-    for name, r in vcc_roots.items():
-        if r is not None and r == r_gnd:
-            shorted.append(name)
+    # 电源-地: 最危险
+    for rn, r in rails.items():
+        for gn, g in grounds.items():
+            if r is not None and r == g:
+                shorted.append((rn, gn, "电源与地"))
+    # 电源-电源 / 地-地: 不同名的两条轨被接在一起
+    for group, kind in ((rails, "两条电源"), (grounds, "两种地")):
+        names = sorted(group)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                if group[names[i]] is not None and \
+                   group[names[i]] == group[names[j]]:
+                    shorted.append((names[i], names[j], kind))
 
     # ---- 检查 2: 元件两端同网 = 被旁路 ----
     # 按元件名聚合端子(端子名形如 R1.a / Q1.c / K1.t)
@@ -82,8 +124,8 @@ def analyze(net_path, quiet=False):
             net = sorted(nets.get(next(iter(roots)), []))
             hint = ""
             # 找"哪条线不该存在": 竖/横线纵穿本体
-            body = sc["bodies"].get(base)
-            if body:
+            # 一个名字可能有多条本体盒(线圈+触点), 逐个试。
+            for body in sc["bodies_by_name"].get(base, []):
                 bx0, by0, bx1, by1 = _norm(body)
                 for sg in wires:
                     x1, y1, x2, y2 = sg
@@ -107,7 +149,7 @@ def analyze(net_path, quiet=False):
 
     # ---- 检查 3: 导线纵穿元件本体 ----
     crossed = []
-    for base, body in sorted(sc["bodies"].items()):
+    for base, body in sc["bodies"]:
         bx0, by0, bx1, by1 = _norm(body)
         for sg in wires:
             x1, y1, x2, y2 = sg
@@ -228,12 +270,13 @@ def report(path, r, show_nets=False):
               "删掉重跑 build.py。")
         n += 1
     for kind, name, old, new, lineno in r.get("conflicts", []):
-        what = "端子" if kind == "T" else "本体盒"
-        print(f"  [重名] {what}「{name}」被登记了两次且位置不同 "
-              f"(第{lineno}行 {new} vs 先前 {old}) —— 后者会**静默覆盖**前者, "
-              f"等于凭空少一个电气实体。")
-        print(f"           → 两个不同器件用了同一个名字。改名(器件名必须 ASCII "
-              f"且唯一), 或确认它们本就该重合。")
+        # 只可能是端子(T): 本体盒允许同名多条(继电器线圈+触点), 已在解析里
+        # 改成保留全部、不覆盖, 所以不再产生 B 冲突。
+        print(f"  [重名] 端子「{name}」被登记在两个不同位置 "
+              f"(第{lineno}行 {new} vs 先前 {old}) —— 一个端子名只能对应"
+              f"一个电气点, 后者会**静默覆盖**前者, 等于凭空少一个端子。")
+        print(f"           → 两个不同器件的端子用了同一个名字。改名"
+              f"(器件名必须 ASCII 且唯一), 或确认它们本就该重合。")
         n += 1
     if r["warns"]:
         # 记账警告: 画图时 TeX 侧发现的不合规事情。不参与连通性判定,
@@ -272,10 +315,12 @@ def report(path, r, show_nets=False):
         print("           → 接线一律用 \\WireH / \\WireV, 它们在侧车里留下"
               " H/V 意图, 斜了会被报出来。")
         n += len(r["slanted"])
-    if r["shorted"]:
-        for name in r["shorted"]:
-            print(f"  [短路] {name} 与 GND 落在同一张网！电路一上电就烧。")
-        n += len(r["shorted"])
+    for a, b, kind in r["shorted"]:
+        print(f"  [短路] {kind}「{a}」与「{b}」落在同一张网！"
+              f"电路一上电就烧(或至少部分失效)。")
+        print(f"           → 顺着网表找那条把它们连起来的线: "
+              f"check_tex_net.py --show-nets")
+        n += 1
     for base, net, hint in r["bypassed"]:
         print(f"  [旁路] {base} 两端接在同一张网 —— 该元件形同不存在{hint}")
         n += 1

@@ -50,8 +50,13 @@ def tex_compile(stem, env):
         return False, "找不到 xelatex(需要 MiKTeX/TeX Live 且装了 ctex)"
     r = run([x, "-interaction=nonstopmode", f"{stem}.tex"], env=env)
     out = (r.stdout or "") + (r.stderr or "")
-    # xelatex 的退出码在 nonstopmode 下不可靠, 必须读日志判定
-    # (与 Keil UV4.exe 那条坑同源: 失败也可能返回 0)
+    # 按**日志标记**判定, 不按退出码。理由(实测): nonstopmode 下 xelatex 遇到
+    # `\undefinedmacro` 这类**可恢复错误**会以 rc=1 退出, **但照样产出 PDF** ——
+    # 只看退出码会把"图能出、但带着错误"判成失败; 反过来若用 rc==0 判成功,
+    # 则"编译出图了但控制台有 ! 错误"会被放过。真正该拦的是 `! ` / Emergency
+    # stop / Fatal error 这些**致命标记**。
+    # (注: xelatex **成功**时 rc=0, 失败 rc=1 —— 曾经把"没设 TEXINPUTS 导致
+    #  sty not found"的失败误当成"成功却返回 1", 现已在正确环境下复核。)
     ok = ("! " not in out and "Emergency stop" not in out
           and "Fatal error" not in out)
     return ok, out
@@ -197,8 +202,10 @@ def main():
             if os.path.exists(svg):
                 os.remove(svg)          # 先删, 好判断这次是否真的产出
             r = run(["pdftocairo", "-svg", pdf, svg])
-            # pdftocairo **失败也返回 0**(实测: 输入不存在时 rc=0, 只是不打
-            # 印文件)。所以必须查产物在不在, 不能只看退出码。
+            # 以**产物是否存在**判定, 不只看退出码。pdftocairo 正常失败时确实
+            # 会返回非 0(实测: 输入不存在 rc=1), 所以退出码可用; 但"以文件为准"
+            # 更稳 —— 它同时覆盖了"rc=0 却没写出文件"这种(理论上可能的)情形,
+            # 而只看退出码抓不到它。开销为零, 所以两个都查。
             if r.returncode != 0 or not os.path.exists(svg):
                 print(f"  失败: pdftocairo rc={r.returncode}, "
                       f"SVG {'没产出' if not os.path.exists(svg) else '已产出'}"
@@ -287,7 +294,7 @@ def probe(spec):
               f"/ {len(sc['annos'])} 文字盒 / {len(sc['wires'])} 导线 ==")
         if sc["bodies"]:
             print("\n-- 器件本体盒 (x0,y0 .. x1,y1 pt; 宽 × 高) --")
-            for n, b in sorted(sc["bodies"].items()):
+            for n, b in sorted(sc["bodies"]):
                 x0, y0 = min(b[0], b[2]), min(b[1], b[3])
                 x1, y1 = max(b[0], b[2]), max(b[1], b[3])
                 print(f"   {n:<14} {x0:8.2f},{y0:9.2f} .. {x1:8.2f},{y1:9.2f}"

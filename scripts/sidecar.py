@@ -61,14 +61,14 @@ def parse_sidecar(path):
       {"wires": [(x1,y1,x2,y2), ...],
        "dots":  [(x,y), ...],
        "terms": {名字: (x,y)},
-       "bodies":{名字: (x0,y0,x1,y1)},
+       "bodies":[(名字, (x0,y0,x1,y1)), ...]   同名可多条(线圈+触点), **不覆盖**
        "powers":[(网络名, x, y), ...],
        "tags":  [(号, x, y), ...],
        "expect":[(端子名, 目标), ...],
        "annos": [(x0,y0,x1,y1, 文字), ...],
        "canvas":(x0,y0,x1,y1) | None}
     """
-    out = {"wires": [], "dots": [], "terms": {}, "bodies": {},
+    out = {"wires": [], "dots": [], "terms": {}, "bodies": [], "containers": [],
            "powers": [], "tags": [], "expect": [], "annos": [], "canvas": None,
            "hint_h": [], "hint_v": [], "warns": [], "annoat": [], "names": [],
            "gsyms": [], "conflicts": []}
@@ -96,10 +96,10 @@ def parse_sidecar(path):
                 elif kind == "T":
                     name, x, y = rest.split("|")
                     pts = (_num(x), _num(y))
-                    # 同名端子重复登记: 静默覆盖会让**先出现的信息消失**
-                    # (两条记录只留最后一条), 而侧车里一条 = 一个电气端子,
-                    # 覆盖等于凭空少一个端子。同坐标的重复是良性的(同一端子
-                    # 被两条路径登记), 异坐标才是真冲突 —— 报出来。
+                    # 同名端子登记在**两个不同点** = 真冲突: 一个端子名只能
+                    # 对应一个电气点, 否则网表会凭空少一个端子。必须报。
+                    # (注意 \Chain/\Bus 会让同一端子在**同一点**被登记两次,
+                    #  那是良性的, 不报 —— 见下面的坐标比对。)
                     if name in out["terms"] and out["terms"][name] != pts:
                         out["conflicts"].append(
                             ("T", name, out["terms"][name], pts, lineno))
@@ -107,10 +107,15 @@ def parse_sidecar(path):
                 elif kind == "B":
                     name, x0, y0, x1, y1 = rest.split("|")
                     box = (_num(x0), _num(y0), _num(x1), _num(y1))
-                    if name in out["bodies"] and out["bodies"][name] != box:
-                        out["conflicts"].append(
-                            ("B", name, out["bodies"][name], box, lineno))
-                    out["bodies"][name] = box
+                    # 本体盒存成**列表**保留全部, 不用 dict 按名覆盖。
+                    # 理由: 一个器件名可以合法地对应**多个**本体盒 ——
+                    # `\CoilNode{K1}`(线圈) 与 `\Contacts{K1}`(触点) 是同一个
+                    # 继电器的两个部件, 坐标本就不同。用 dict 会让后一个覆盖
+                    # 前一个, 排版门于是**看不到被覆盖的那个盒**, 器件重叠/
+                    # 越界/压字都漏检(实测: 触点把线圈的盒顶掉了)。
+                    # 端子(T)仍用 dict, 因为端子是**单个电气点**, 同名只应是
+                    # 同一个点(见下面的冲突判定)。
+                    out["bodies"].append((name, box))
                 elif kind == "P":
                     name, x, y = rest.split("|")
                     out["powers"].append((name, _num(x), _num(y)))
@@ -151,6 +156,14 @@ def parse_sidecar(path):
                     name, x0, y0, x1, y1 = rest.split("|")
                     out["gsyms"].append((name, _num(x0), _num(y0),
                                          _num(x1), _num(y1)))
+                elif kind == "K":
+                    # K|名|x0|y0|x1|y1 —— **容器框**(MCU 方块这类)。
+                    # 与 B| 同为矩形, 但语义不同: 容器参与"器件重叠/越界",
+                    # 不参与"文字压器件"(引脚名本来就写在方块里)与电气
+                    # "穿体"(MCU 不是会被旁路的元件)。见 \ContainerBox。
+                    name, x0, y0, x1, y1 = rest.split("|")
+                    out["containers"].append(
+                        (name, (_num(x0), _num(y0), _num(x1), _num(y1))))
                 elif kind == "N":
                     # N|生成坐标名|... —— \ShowNames 的产物, 纯参考, 检查器忽略
                     out["names"].append(rest)
@@ -165,7 +178,16 @@ def parse_sidecar(path):
             except (ValueError, IndexError):
                 bad.append((lineno, line))
     out["unparsed"] = bad
+    out["bodies_by_name"] = bodies_by_name(out)
     return out
+
+
+def bodies_by_name(sc):
+    """{名字: [本体盒, ...]} —— 一个名字可能有**多个**盒(继电器线圈+触点)。"""
+    d = {}
+    for name, box in sc["bodies"]:
+        d.setdefault(name, []).append(box)
+    return d
 
 
 # ================================================================
