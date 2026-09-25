@@ -1,0 +1,25 @@
+# 编译产物与中间文件
+*.aux
+*.log
+*.out
+*.pdf
+*.svg
+*.net
+*.xdv
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# 生成的偏移表（由 place.py 产出，每次构建可再生）
+auto_offsets.tex
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

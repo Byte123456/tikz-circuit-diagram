@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+一键闭环 —— 编译 → 自动摆标注 → 重编 → 双门 → 出 SVG。
+
+为什么要有它: 五道工序散成五条命令时, 漏跑一道的代价是"以为检过了其实没检"
+(开发本工具时的真事: 排版门一度看不到值标签, 报 0 问题; 不是"查了没问题",
+是"压根没看")。串成一条命令, 漏跑就成了执行不了。
+
+**工作目录 = 你运行它的目录**(不是脚本所在目录)。图与产物都留在你当前所在的
+工程目录里; `stm32tikz.sty` 由脚本自动加进 TEXINPUTS, 不用拷贝、不用改
+preamble 里的 \\usepackage 路径。
+
+用法:
+    python <skill>/scripts/build.py circuit            # 不给扩展名
+    python <skill>/scripts/build.py circuit.tex        # 给也行
+    python <skill>/scripts/build.py circuit --svg      # 额外出 SVG
+    python <skill>/scripts/build.py circuit --no-place # 关掉自动摆标注
+    python <skill>/scripts/build.py circuit --report   # 逐个列出摆位结果
+
+退出码: 0 = 全绿; 1 = 有一道门报问题; 2 = 编译失败或用法错误。
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths                                        # noqa: E402
+
+
+def run(cmd, env=None):
+    """在**当前工作目录**跑命令(不是脚本目录)。"""
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          env=env or os.environ.copy())
+
+
+def find_xelatex():
+    """找 xelatex —— 统一走 _paths, 不在这里写死用户目录。"""
+    return _paths.find_xelatex()
+
+
+def tex_compile(stem, env):
+    """跑一遍 xelatex。返回 (ok, 输出)。"""
+    x = find_xelatex()
+    if not x:
+        return False, "找不到 xelatex(需要 MiKTeX/TeX Live 且装了 ctex)"
+    r = run([x, "-interaction=nonstopmode", f"{stem}.tex"], env=env)
+    out = (r.stdout or "") + (r.stderr or "")
+    # xelatex 的退出码在 nonstopmode 下不可靠, 必须读日志判定
+    # (与 Keil UV4.exe 那条坑同源: 失败也可能返回 0)
+    ok = ("! " not in out and "Emergency stop" not in out
+          and "Fatal error" not in out)
+    return ok, out
+
+
+def first_errors(out, n=8):
+    keys = ("!", "Undefined control sequence", "No shape named",
+            "Giving up on this path", "Illegal unit of measure",
+            "Unknown function", "Missing character")
+    return [ln for ln in out.splitlines() if any(k in ln for k in keys)][:n]
+
+
+def gate(script, net, extra=()):
+    here = os.path.dirname(os.path.abspath(__file__))
+    r = run([sys.executable, os.path.join(here, script), *extra, net])
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="一键闭环: 编译 → 摆位 → 双门 → SVG")
+    ap.add_argument("tex", help=".tex 文件名或主干(可省扩展名)")
+    ap.add_argument("--svg", action="store_true", help="额外用 pdftocairo 出 SVG")
+    ap.add_argument("--no-place", action="store_true", help="关掉自动摆标注")
+    ap.add_argument("--report", action="store_true", help="摆位时逐个列出结果")
+    ap.add_argument("--probe", metavar="TEX",
+                    help="编译一个一次性探针文档并打印侧车摘要(不跑门禁)。"
+                         "TEX 给 `-` 表示从 stdin 读。省掉手写探针和 TEXINPUTS 的坑")
+    args = ap.parse_args()
+
+    if args.probe is not None:
+        return probe(args.probe)
+
+    stem = args.tex[:-4] if args.tex.lower().endswith(".tex") else args.tex
+    # 工作目录 = 用户当前目录
+    if not os.path.exists(stem + ".tex"):
+        print(f"错误: 当前目录下找不到 {stem}.tex\n"
+              f"  (工作目录: {os.getcwd()})", file=sys.stderr)
+        return 2
+
+    sty_dir = _paths.find_sty()
+    if not sty_dir:
+        print(_paths.sty_hint(), file=sys.stderr)
+        return 2
+    env = _paths.texinputs_env()
+    print(f"样式: {os.path.join(sty_dir, 'stm32tikz.sty')}")
+
+    net = stem + ".net"
+
+    # ---- 第 1 遍 ----
+    print(f"[1/5] xelatex {stem}.tex (第 1 遍)")
+    if os.path.exists(net):
+        os.remove(net)                       # 避免读到上一轮残留
+    ok, out = tex_compile(stem, env)
+    if not ok or not os.path.exists(net):
+        print("  编译失败。前几条:")
+        for ln in first_errors(out, 10):
+            print("    " + ln)
+        log = stem + ".log"
+        if os.path.exists(log):
+            with open(log, encoding="utf-8", errors="replace") as f:
+                for ln in first_errors(f.read(), 14):
+                    print("    " + ln)
+        return 2
+    print("  ok")
+
+    # ---- 自动摆位 + 第 2 遍 ----
+    if not args.no_place:
+        print("[2/5] place.py 解算标注偏移")
+        here = os.path.dirname(os.path.abspath(__file__))
+        cmd = [sys.executable, os.path.join(here, "place.py"), net]
+        if args.report:
+            cmd.append("--report")
+        r = run(cmd)
+        print("  " + (r.stdout or "").strip().replace("\n", "\n  "))
+        if r.returncode in (0, 1):
+            print("[3/5] xelatex (第 2 遍, 偏移生效)")
+            ok2, out2 = tex_compile(stem, env)
+            if not ok2:
+                print("  第二遍编译失败:")
+                for ln in first_errors(out2):
+                    print("    " + ln)
+                return 2
+            print("  ok")
+        else:
+            print("[3/5] 跳过")
+    else:
+        print("[2/5] 自动摆位: 关掉了 (--no-place)")
+        print("[3/5] 跳过")
+
+    # ---- 双门 ----
+    print("[4/5] 两道门")
+    rc_l, o_l = gate("check_tex_layout.py", net)
+    rc_n, o_n = gate("check_tex_net.py", net)
+    for o in (o_l, o_n):
+        for ln in o.rstrip().splitlines():
+            if ln.startswith("=====") or ln.startswith("==") or "  [" in ln:
+                print("  " + ln)
+    if rc_l == 0 and rc_n == 0:
+        print("  排版 0 / 电气 0 —— 全绿")
+    else:
+        print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— 有问题:")
+        for o, rc in ((o_l, rc_l), (o_n, rc_n)):
+            if rc != 0:
+                print(o)
+
+    # ---- SVG ----
+    if args.svg:
+        print("[5/5] pdftocairo -svg")
+        pdf = stem + ".pdf"
+        if not os.path.exists(pdf):
+            print("  跳过(没有 .pdf)")
+        elif not shutil.which("pdftocairo"):
+            print("  跳过(没装 pdftocairo; .pdf 已经能用)")
+        else:
+            r = run(["pdftocairo", "-svg", f"{stem}.pdf", f"{stem}.svg"])
+            print("  ok" if r.returncode == 0 else f"  失败: {r.stderr[:200]}")
+    else:
+        print("[5/5] SVG: 未请求 (加 --svg)")
+
+    return 0 if (rc_l == 0 and rc_n == 0) else 1
+
+
+def probe(spec):
+    """
+    探测模式: 编译一段临时 .tex, 把侧车里的几何**摘要**打印出来。
+
+    为什么需要它: 想知道"某符号的端子在哪个偏移、本体多大", 以前要手写探针
+    .tex 再编译读侧车 —— 而裸 `xelatex` **不会**自动加 TEXINPUTS, 于是第一脚
+    就踩 `stm32tikz.sty not found`; `\\typeout` 的输出在 stdout 里 grep 不到,
+    得去 tail 日志; 测出来的数还要手抄。这一模式把这三步都省了, 而且用的是
+    与正式 build **完全相同**的编译环境(同一个 TEXINPUTS、同一个 xelatex),
+    所以探针里能编译通过的, 正式图里一定能通过。
+
+    用法:
+        python <skill>/scripts/build.py x --probe probe.tex
+        python <skill>/scripts/build.py x --probe -      # 从 stdin 读
+
+    探针文档的常规写法(见 assets/geometry.md 的生成脚本也是这么干的):
+        \\documentclass[border=4pt]{standalone}
+        \\usepackage{ctex}
+        \\usepackage{stm32tikz}
+        \\begin{document}
+        \\begin{tikzpicture}
+        \\cNPN{Q}{0,0}
+        \\cR{R1}{3,0}{4.5,0}{10K}\\LogLabel{R1}
+        \\DumpCanvas
+        \\end{tikzpicture}
+        \\end{document}
+    """
+    import tempfile
+    if spec == "-":
+        src = sys.stdin.read()
+    else:
+        if not os.path.exists(spec):
+            print(f"错误: 找不到探针文件 {spec}", file=sys.stderr)
+            return 2
+        with open(spec, encoding="utf-8") as f:
+            src = f.read()
+
+    sty_dir = _paths.find_sty()
+    if not sty_dir:
+        print(_paths.sty_hint(), file=sys.stderr)
+        return 2
+    env = _paths.texinputs_env()
+
+    tmp = tempfile.mkdtemp(prefix="snprobe_")
+    try:
+        with open(os.path.join(tmp, "probe.tex"), "w", encoding="utf-8") as f:
+            f.write(src)
+        # 在临时目录里编译 —— 探针不该污染当前工作目录
+        r = subprocess.run([find_xelatex() or "xelatex",
+                            "-interaction=nonstopmode", "probe.tex"],
+                           cwd=tmp, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=180)
+        net = os.path.join(tmp, "probe.net")
+        out = (r.stdout or "") + (r.stderr or "")
+        errs = first_errors(out)
+        if errs:
+            print("编译有错误:")
+            for ln in errs:
+                print("   " + ln)
+        if not os.path.exists(net):
+            print("错误: 没产出侧车 probe.net", file=sys.stderr)
+            return 2
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from sidecar import parse_sidecar
+        sc = parse_sidecar(net)
+
+        print(f"== 探针侧车: {len(sc['terms'])} 端子 / {len(sc['bodies'])} 本体盒 "
+              f"/ {len(sc['annos'])} 文字盒 / {len(sc['wires'])} 导线 ==")
+        if sc["bodies"]:
+            print("\n-- 器件本体盒 (x0,y0 .. x1,y1 pt; 宽 × 高) --")
+            for n, b in sorted(sc["bodies"].items()):
+                x0, y0 = min(b[0], b[2]), min(b[1], b[3])
+                x1, y1 = max(b[0], b[2]), max(b[1], b[3])
+                print(f"   {n:<14} {x0:8.2f},{y0:9.2f} .. {x1:8.2f},{y1:9.2f}"
+                      f"   {x1 - x0:6.2f} × {y1 - y0:6.2f}")
+        if sc["terms"]:
+            print("\n-- 端子 (名字 @ x,y pt) --")
+            for n, (x, y) in sorted(sc["terms"].items()):
+                print(f"   {n:<20} ({x:8.2f}, {y:9.2f})")
+        if sc.get("gsyms"):
+            print("\n-- 电源/地符号图形范围 --")
+            for g in sc["gsyms"]:
+                print(f"   {g[0]:<8} x {g[1]:8.2f}..{g[3]:8.2f}"
+                      f"   y {g[2]:9.2f}..{g[4]:9.2f}")
+        if sc["annos"]:
+            print("\n-- 文字盒 (含值标签) --")
+            for a in sc["annos"]:
+                kind = {"L": "值标签", "R": "标注"}.get(a[5], a[5])
+                print(f"   [{kind}] {a[4][:44]:<46}"
+                      f" 宽 {abs(a[2] - a[0]):6.2f} 高 {abs(a[3] - a[1]):6.2f}")
+        if sc.get("annoat"):
+            print("\n-- 自动摆位记录 (A|) --")
+            for a in sc["annoat"]:
+                print(f"   {a['key']:<16} 锚点 ({a['ax']:8.2f},{a['ay']:9.2f})"
+                      f"  角次序 {a['corners']!r}")
+        if sc.get("warns"):
+            print("\n-- 记账警告 --")
+            for w in sc["warns"]:
+                print("   " + w)
+        print(f"\n完整侧车留在: {net}")
+        return 0
+    finally:
+        pass      # 探针目录**故意不删** —— 报错时用户要能去看 probe.log
+
+
+if __name__ == "__main__":
+    sys.exit(main())

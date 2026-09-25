@@ -1,0 +1,352 @@
+% =====================================================================
+%  光电二极管光控开关 —— 用 TikZ/circuitikz 重画
+%  =====================================================================
+%
+%  本文件只做三件事: 摆器件、连线、标注。
+%  **所有端子坐标都来自锚点/命名坐标, 没有一处手填的偏移量** ——
+%  这是"几乎所有接线缺陷的共同成因", 从结构上杜绝。
+%
+%  编译:  xelatex -interaction=nonstopmode photodiode_relay.tex
+%  出图:  pdftocairo -svg photodiode_relay.pdf photodiode_relay.svg
+%  体检:  python check_tex_net.py    photodiode_relay.net   (电路对不对)
+%         python check_tex_layout.py photodiode_relay.net   (排版好不好看)
+%
+%  编译产物 photodiode_relay.net 就是**网表侧车** —— 由本文件排版时顺手写出
+%  (画线即记账), 不是事后从图里反推的。
+%
+%  ⚠ 六条硬规矩（都是这轮踩出来的坑, 照抄不要改）:
+%
+%   1. **坐标参数不写外层括号**：\WireH{A}{B} 而不是 \WireH{(A)}{(B)}。
+%      宏内部自己补括号; 传进去带括号会变成 ((A)), pgf 报
+%      "No shape named `(A' is known"。
+%
+%   2. **calc 表达式里节点名必须带括号**：$(Q1e)+(0,-0.8cm)$,
+%      **不是** $Q1e+(0,-0.8cm)$。后者 pgf 会把 Q1e 当成一个数学函数名,
+%      报 "File ended while scanning use of \tikz@cc@parse@factor"。
+%
+%   3. 器件名一律 ASCII(R1/D2/K1…), 中文只作显示标签。\pgfpointanchor
+%      解析 `K1线圈.t` 会把中文当成数学函数名而报错。
+%
+%   4. 接线一律 \WireH / \WireV —— 它们在侧车里写下 H/V 意图, 斜了会被
+%      check_tex_net.py 报出来。**斜线在连通性分析里没有定义, 会被静默
+%      忽略(= 漏检)**, 所以不能让斜线悄悄溜过去。
+%
+%   5. 行列交点用 `A |- B` / `A -| B` 取, **不要自己算坐标**。这样"拐到
+%      某元件的行/列"永远精确落在锚点上; 手算错了就是一条线差几十 pt,
+%      若两端没接上, 还会表现为 [非正交]。
+%
+%   6. **竖直元件的两端 y 必须落在本体之外**: 电阻本体在两端点连线的
+%      中段(-0.37..-1.33cm), 任何"从本体上方一路画到本体下方"的竖线
+%      都是 [穿体](= 把该元件旁路)。所以节点要放在本体的上/下**外侧**,
+%      且接线只从最近的端子起笔。
+% =====================================================================
+\documentclass[border=12pt]{standalone}
+\usepackage{ctex}
+\usepackage{stm32tikz}
+\input{pins.tex}                  % 引脚由 gen_pins.py 从工程读出, 非手抄
+
+\begin{document}
+\begin{tikzpicture}[font=\small]
+
+% 标注偏移表 —— 由 place.py 从上一遍编译的侧车里解算出来。
+% 文件不存在时(全新图、还没跑过 place.py)全部退化成 0 偏移, 编译照常,
+% 标注只是叠在各自的锚点上; 跑一次 build.py 就到位了。
+\InputAnnoOffsets{auto_offsets.tex}
+
+% =====================================================================
+%  ① 传感支路:  +3.3V ── R1 ── tap ── PD1(反偏) ── GND
+% =====================================================================
+\coordinate (senseTop) at (0,0);
+\cVCC{+3.3V}{senseTop}
+\cRes{R1}{senseTop}{0,-1.7}{10K}
+\LogLabel{R1}
+\coordinate (tap) at (R1b);             % 分压点 = R1 下端
+% 元件标注分工: circuitikz 的 `l=` 出**数值**(自动摆在元件旁, 位置由库决定);
+% \Anno 只出**位号**(R1/D2…), 摆在另一侧。两段字各占一边, 不会撞。
+\AnnoAt{r1name}{ann, font=\footnotesize}{R1.west}{west}{R1}
+
+% 光敏管必须**反偏**: 阴极朝上(接分压点侧)、阳极朝下(接地)。
+% circuitikz 的 D 类符号: a = 阳极, b = 阴极, 三角形由 a 指向 b。
+% 所以"阴极朝上" => **从下往上画**(起点在下, 即 a 在下)。
+\cPD{PD1}{0,-4.6}{0,-2.8}
+\coordinate (pdA) at (PD1a);            % 阳极(下)
+\coordinate (pdK) at (PD1b);            % 阴极(上)
+
+% ⚠ 这里**不要**再写 \WireV{senseTop}{R1a}: senseTop 与 R1a 是同一个点
+% (\cRes 的第一个参数就是起点), 那样画出来的是一条**零长导线**。它不影响
+% 连通性, 但记账时会被报出来(见 build 输出的 [记账]), 而且它说明"你以为
+% 两个点是分开的"。电源符号落在 R1a 上就已经连上了, 不需要线。
+\WireV{R1b}{pdK}
+\WireV{pdA}{0,-5.3}
+\cGND{0,-5.3}
+\Junction{tap}
+\AnnoAt{pd1name}{ann}{PD1.west}{west,south west}{PD1 光敏二极管}
+\AnnoAt{pd1rev}{ann, font=\footnotesize}{PD1.west}{west,south west}{阴极朝上 = 反偏}
+
+% 期望网络断言 —— 唯一能抓「接到错的节点上」的手段。
+% PD1 阴极接**分压点**(R1 下端), 不是直接接 +3.3V: 直接接电源的话光电流
+% 不流过 R1, 分压点不随光照变化, 整个传感器失效。这条断言专钉这个错。
+\Expect{PD1.b}{R1.b}
+\Expect{PD1.a}{GND}
+
+% ---- RV1 (10K 可调): 分压点对地, 定"多亮才算亮"的触发点 ----
+% ⚠ 这条支路是**真实出过缺陷**的地方: 
+%   曾经有一张同电路的图, RV1 下端引线离地母线差 40px, 支路完全断开,
+%   而连通性检查报 0 问题 —— 因为 RV1.b 确实碰到了它自己那根(悬空的)导线:
+%   连通性检查只比"端子之间通不通", 从不检查"这条支路有没有连到该连的地方"。
+%   本图用 \Expect 把 RV1 两端**钉在网络名上**, 这类"支路整体悬空"就能抓。
+% (走线放在传感支路左侧的独立通道 x=-4.6, 不与任何元件/线交叉)
+\cRes{RV1}{-4.6,-2.1}{-4.6,-3.6}{10K}
+\LogLabel{RV1}
+% ⚠ 画竖直元件时 **a = 起点、b = 终点** —— 起点在上就是 a 在上。
+%   写反了会怎样: 接线还是接到"自己以为的那个端子名"上, 但实际接的是
+%   另一头, 于是线从本体上跨了过去 → [穿体]/[旁路], 而且图上只是一根
+%   普通的竖线, 肉眼完全看不出。这次就是被 check_tex_net.py 当场抓住的。
+\coordinate (rvT) at (RV1a);            % 上端(靠分压点)
+\coordinate (rvB) at (RV1b);            % 下端(靠地)
+% **两端各接各的端子, 就近起笔**:
+%   分压点行的横线 → rvT; rvB → 向下到地。两条线各自落在本体外侧。
+\WireH{tap}{-4.6,-1.7}
+\WireV{-4.6,-1.7}{rvT}
+\WireV{rvB}{-4.6,-4.3}
+\cGND{-4.6,-4.3}
+\AnnoAt{rv1name}{ann, font=\footnotesize}{RV1.west}{west,south west}{RV1 可调}
+\Expect{RV1.a}{R1.b}
+\Expect{RV1.b}{GND}
+
+% =====================================================================
+%  ② ADC 低通:  tap ── R4 ── adcNode ──┬── C1 ── GND
+%                                      └── PA0
+% =====================================================================
+% 滤波块放在传感支路右侧的独立通道(x≥3.4): 分压点先横出去再下行,
+% **绝不从 x=0 往下走** —— 那样会纵穿 PD1 本体。
+% **这一行只定义一次**: 原来 -3.9 在源码里手写了 4 处 —— filtL 的 y、
+% R4 的终点、adcNode、c1X。改行要逐个去找, 漏一处就错位, 而错位几 pt 是
+% 看不出来的(不压字、不重叠, 门禁一条都不报)。现在这几处都从 adcRow
+% 取 y, 挪这一行只需要改一处。
+\coordinate (adcRow) at (0,-3.9);
+\RowAt{filtL}{adcRow}{3.4}
+\RowAt{r4R}{adcRow}{5.5}
+\cRes{R4}{filtL}{r4R}{10K}
+\LogLabel{R4}
+\RowAt{adcNode}{adcRow}{6.6}
+\WireH{tap}{3.4,-1.7}
+\WireV{3.4,-1.7}{R4a}
+\WireH{R4b}{adcNode}
+\Junction{adcNode}
+\AnnoAt{r4name}{ann, font=\footnotesize}{R4.south}{south,south east}{R4}
+
+% C1 挂在 adcNode 右侧的独立竖直支路。电容两端都在本体外: 上端接线到
+% adcNode 行, 下端接线到地。
+%
+% ⚠ x 必须离 ADC 竖直长线(x=6.6cm)足够远: circuitikz 把 `l=` 值标签放在
+%   元件左侧约 12pt 处, 离得太近标签就会横穿那根长线 → 排版门 [文字压线]。
+%   这里取 10.0cm, 与 ADC 线拉开约 96pt。
+% 同理, C1 这一**列**的 x 也只定义一次(原来 10.0 手写了 4 次)。
+\coordinate (c1Col) at (10.0,0);
+\RowAt{c1X}{adcRow}{10.0}
+\WireH{adcNode}{c1X}
+\Junction{c1X}
+\ColAt{c1Top}{c1Col}{-5.9}
+\ColAt{c1Bot}{c1Col}{-4.4}
+\cCap{C1}{c1Top}{c1Bot}{100nF}
+\LogLabel{C1}
+\coordinate (c1A) at (C1a);                 % 下端(靠地)
+\coordinate (c1B) at (C1b);                 % 上端(靠 adcNode)
+% **接最近的端子** —— 从 adcNode 行(-3.9)接线必须落到 c1B(-4.4),
+% 若落到 c1A(-5.9) 就纵穿电容本体 = [旁路], 电容形同不存在。
+\WireV{c1X}{c1B}
+\ColAt{c1Gnd}{c1Col}{-6.6}
+\WireV{c1A}{c1Gnd}
+\cGND{c1Gnd}
+% 位号放 C1 右侧(值标签在左), 两段字一个左一个右, 不会撞。
+% C1 的取值理由已在右下"取值理由"框里, 这里不再重复 —— 重复会造成
+% [文字重叠], 而且图上一处信息说两遍是噪音。
+\AnnoAt{c1name}{ann, font=\footnotesize}{C1.east}{east,north east}{C1}
+
+% =====================================================================
+%  ③ MCU（左下）
+% =====================================================================
+% 引脚只给名字, y 偏移由 \MCUauto 按间距自动等距、整体居中 ——
+% 原来手写 `\PinADC/0.5cm, \PinDrive/-0.6cm`, 加一个引脚就得重算全部偏移,
+% 而且手算差几 pt 是看不出来的(不压字不重叠, 门禁不报)。
+\MCUauto{MCU}{-1.2}{-12.2}{3.0cm}{3.4cm}
+    {STM32F103C8T6 · 控制域}{0.9cm}
+    {\PinADC, \PinDrive}
+\coordinate (pinADC)   at (MCU\PinADC);
+\coordinate (pinDrive) at (MCU\PinDrive);
+
+% ADC 引出点 -> PA0: 竖直下到 PA0 行(`|-` 取交点, 不手算 y), 再水平进引脚。
+% 竖直段走 x=6.6 —— 在驱动块(x≥9.4)左侧, 不碰任何元件。
+\coordinate (adcCorner) at (adcNode |- pinADC);
+\WireV{adcNode}{adcCorner}
+\WireH{adcCorner}{pinADC}
+% 标注要**朝背离导线的一侧**展开。anchor=south west 是从锚点向**右**长,
+% 而锚点就落在 ADC 竖直段(x=188)上 —— 文字会横穿那根线(排版门 [文字压线])。
+% 改 south east 让文字向左展开, 就离开了导线。
+\AnnoAt{adcpin}{ann, font=\footnotesize}{adcCorner}{south east,north east}{\PinADC{} = ADC 输入（读光强）}
+
+% =====================================================================
+%  ④ 驱动级:  \PinDrive ── R2 ── Q1.b ;  Q1.e ── GND
+% =====================================================================
+\coordinate (qPos) at (17.8,-9.8);
+\cNPN{Q1}{qPos}
+\AnnoAt{q1name}{annb}{Q1.north}{north}{Q1}
+\AnnoAt{q1part}{ann, font=\footnotesize}{Q1.south east}{south east,east}{S8050}
+
+% R2 用 1.4cm 固定长度, 再用导线接进基极端子 —— 不要把 R2 从远处直接画到
+% Q1b, 那样 circuitikz 会把电阻本体拉长变形。
+\cRes{R2}{15.4,-9.8}{16.8,-9.8}{1K}
+\LogLabel{R2}
+\coordinate (r2A) at (R2a);
+\WireH{R2b}{Q1b}
+\AnnoAt{r2name}{ann, font=\footnotesize}{R2}{south}{R2}
+
+% PA1 -> R2: 右出 -> 上到基极行 -> 右进 R2。
+% 竖直段走 x=9.4: 在 ADC 竖直段(x=6.6)右侧、D2 支路(x=10.2)左侧, 不交叉。
+\coordinate (drvCol)  at (11.2,0);
+\coordinate (drvFoot) at (drvCol |- pinDrive);
+\coordinate (drvHead) at (drvCol |- R2a);
+\WireH{pinDrive}{drvFoot}
+\WireV{drvFoot}{drvHead}
+\WireH{drvHead}{r2A}
+% drvHead 落在驱动竖直段(x=256)上; anchor=north west 向右长会压住它。
+% 换 north east 向左展开, 同时抬高一点避开 R2 那一行。
+\AnnoAt{drvpin}{ann, font=\footnotesize}{drvHead}{south east,north east}{\PinDrive{} 输出高 → Q1 导通}
+
+\WireV{Q1e}{$(Q1e)+(0,-0.9cm)$}
+\cGND{$(Q1e)+(0,-0.9cm)$}
+
+% =====================================================================
+%  ⑤ 线圈 + 续流管:  +5V ─┬─ K1线圈 ─ Q1.c
+%                          └─ D2(反并联, 阴极朝上)
+% =====================================================================
+% busY 必须落在 D2 本体**上方**(本体 ≈ 两端点中段)。若母线压在本体区间里,
+% =====================================================================
+%  ⑤ 线圈 + 续流管:  +5V ─┬─ K1线圈 ─ Q1.c
+%                          └─ D2(反并联, 阴极朝上)
+% =====================================================================
+% 这一块是**并联**结构(线圈与续流管反并联), 不是串联, 所以 \Chain 不适用
+% —— \Chain 串的是"依次相接"的元件。两个器件各自竖放, 再手工接成并联。
+%
+% ⚠ 为什么必须**竖放**: 反并联要求两个器件从同一对节点(A=+5V 侧, B=集电极
+%   侧)分别引出, 竖放才能让"上端接 A、下端接 B"一目了然。横放会把两个器件
+%   都摊在同一行, 反并联关系在图上完全看不出来。
+%
+% ⚠ 续流管方向: 与线圈反并联 —— 阴极朝 +5V(上)、阳极朝集电极(下)。
+%   D 类符号 a=阳极 b=阴极, 所以**从下往上画**(起点在下)。画反了 = 续流管
+%   正偏导通 = 线圈一通电就被短路, 继电器永远吸不合。**任何门禁都查不出
+%   方向**(两极接的还是那两张网), 只能人眼核对渲染图。
+\coordinate (busY)   at (0,-5.2);
+\coordinate (fdX)    at (12.4,0);
+\coordinate (coilX)  at (14.8,0);
+\coordinate (collRow) at (fdX |- Q1c);       % 集电极行 = Q1.c 的 y(锚点给出)
+\coordinate (vcc5)    at (coilX |- busY);
+
+\cVCC{+5V}{vcc5}
+\WireH{fdX |- busY}{vcc5}                    % +5V 母线
+\Junction{vcc5}
+
+\CoilNode{K1}{14.8,-7.2}{K1}
+\WireV{vcc5}{K1t}
+
+% 续流管: 阴极朝上 => 起点(下)是阳极
+\cD{D2}{12.4,-7.2}{12.4,-5.7}
+\coordinate (fdA) at (D2a);
+\coordinate (fdK) at (D2b);
+\coordinate (fdTop) at (fdX |- busY);
+\WireV{fdTop}{fdK}
+
+% 续流管阳极 -> 集电极行; 线圈下端 -> 集电极行; 合并后水平进 Q1.c
+\coordinate (fdFoot)   at (fdX   |- collRow);
+\coordinate (coilFoot) at (coilX |- collRow);
+\WireV{fdA}{fdFoot}
+\WireV{K1b}{coilFoot}
+\Junction{fdFoot}
+\WireH{fdFoot}{coilFoot}
+\Junction{coilFoot}
+\WireH{coilFoot}{Q1c}
+
+\AnnoAt{d2name}{ann}{D2.west}{west,south west}{D2 1N4148 续流}
+\AnnoAt{k1name}{ann}{K1.east}{east}{K1 继电器 5V}
+\AnnoAt{k1par}{ann, font=\footnotesize}{K1.east}{east,south east}{线圈与 D2 反并联}
+\Expect{D2.b}{+5V}
+\Expect{D2.a}{K1.b}
+
+% =====================================================================
+%  ⑥ 触点 + 指示灯:  +5V ── 触点 ── R3 ── LED1 ── GND
+% =====================================================================
+% 电流自左向右: +5V → 触点 → R3 → **LED 阳极** → 阴极 → GND。
+% LED 符号 a=阳极在左 b=阴极在右 => 阳极朝 R3, 与电流方向一致。
+%
+% 触点两端子 com/no 的 y 由 \Contacts 内部几何决定, **不要手算** ——
+% 下面所有"拐到触点那一行"的位置一律用 `A |- B` 取交点。
+\Contacts{CT1}{21.2,-14.6}
+\AnnoAt{ct1name}{ann, font=\footnotesize}{CT1com}{south west,south}{K1 常开触点}
+
+% 触点侧 +5V: 先向左取 ctFeed(与 CT1com **同一行**), 再在 ctFeed 正上方放
+% 电源符号。顺序反了会得到"同列"而不是"同行", 两条线的正交方向就装反了
+% (检查器报 [非正交])。
+\coordinate (ctFeed) at ($(CT1com)+(-1.7cm,0)$);
+\coordinate (ctVcc)  at ($(ctFeed)+(0,1.6cm)$);
+\cVCC{+5V}{ctVcc}
+\WireV{ctVcc}{ctFeed}
+\WireH{ctFeed}{CT1com}
+\AnnoAt{ctvcc}{ann, font=\footnotesize}{ctVcc}{east,north east}{触点侧 +5V}
+
+% R3 / LED1 摆在 CT1no **同一行**上, 用 \Chain 串起来 —— 位置只给起点
+% (用 `|-` 从触点端子取, 不手算 y), 间距由步进向量定, 串联关系由 TikZ
+% 路径本身保证。以后要拉开间距, 只改 `1.6cm` 一个数, 不重算任何端子坐标
+% (旧写法要手算 r3Pos / ledL 两处, 改一次元件尺寸就得全部重算)。
+%
+% ⚠ 元件名带前缀(LEDSR3 / LEDSLED1) —— 多条支路常共用 "R" 这种键, 不加
+%   前缀会互相覆盖。
+%
+% LED 符号 a=阳极 b=阴极, 而路径**自左向右**画 => 阳极在左、紧邻 R3, 与
+% 电流方向(+5V→触点→R3→阳极→阴极→GND)一致。若要反过来接, 光改符号写法
+% 不够 —— **极性门禁查不出, 必须人眼核对渲染图**(见 COMPARISON.md §4)。
+% ⚠ 起点坐标先落到命名坐标再传进来 —— **不要**把 `(24.0,0 |- CT1no)` 这种
+%   "竖线与行的交点"表达式直接写进宏参数: 宏参数会被先行扫描/展开,
+%   pgf 拿到的已不是原样的坐标表达式, 报
+%   "Giving up on this path. Did you forget a semicolon?"。
+%   命名坐标是先算好的具体点, 传宏参数没有任何歧义。
+%
+%   取交点的语义: `A |- B` = 取 A 的 x、B 的 y。要"x=24 的竖线 ∩ 触点行",
+%   就把 (24.0,0) 放前面。
+\coordinate (ledStart) at (24.0,0 |- CT1no);
+\Chain{LEDS}{ledStart}{1.6cm,0}{R3/R/1K, LED1/leD/{}}
+\coordinate (r3A)   at (LEDSR3a);
+\coordinate (r3B)   at (LEDSR3b);
+\coordinate (ledA)  at (LEDSLED1a);
+\coordinate (ledK)  at (LEDSLED1b);
+\WireH{CT1no}{r3A}
+\AnnoAt{r3name}{ann, font=\footnotesize}{LEDSR3}{south}{R3}
+% ⚠ 标注要避开**值标签**。`1K` 由 circuitikz 自动摆在元件上方, 而这里
+%   若也用 anchor=south 在元件正上方写位号, 两段字就会叠在一起。
+%   这个重叠**在修复 \LogLabel 之前是看不见的** —— 值标签没进侧车, 排版门
+%   就不知道它存在。修复后当场报出(见 style 里 \LogLabel 的注释)。
+%   门禁给的建议是"右移 ≥7.3pt", 照做 —— 它在右侧展开, 比往上挪更省空间
+%   (上方已经站了值标签)。
+\AnnoAt{led1name}{ann, font=\footnotesize}{LEDSLED1.east}{east,north east}{LED1（阳极朝 R3）}
+
+\coordinate (ledGndX) at ($(ledK)+(0.9cm,0)$);
+\WireH{ledK}{ledGndX}
+\WireV{ledGndX}{$(ledGndX)+(0,-0.9cm)$}
+\cGND{$(ledGndX)+(0,-0.9cm)$}
+
+% 电流方向断言: LED1.a 是**阳极**、紧邻 R3 的**右**端子(LEDSR3b)。写成
+% LEDSR3a 会被立刻报出来 —— 门禁查不出"两端接反", 但"接到错的节点"能查。
+\Expect{LEDSLED1.a}{LEDSR3.b}
+\Expect{LEDSLED1.b}{GND}
+\Expect{CT1.no}{LEDSR3.a}
+
+% =====================================================================
+%  说明（两道机械门都查不出**极性/方向**）
+% =====================================================================
+\Anno{ann, align=left, anchor=north west, text width=8.4cm}{(-1.4,-17.4)}{\textbf{极性提示 —— 两道机械门都查不出方向, 必须人眼核对}\\[3pt] ① PD1 必须\textbf{反偏}：阴极朝上(分压点侧)、阳极朝地。反偏时暗电流极小, 受光产生的光电流与 R1 分流 → 分压点电压随光照变化。\\[2pt] ② Q1 共射开关是\textbf{反相}的：基极高 → 导通 → 线圈带电 → 触点闭合。\\[2pt] ③ LED1 电流自左向右（触点 → R3 → 阳极 → 阴极 → GND）； 画反了二极管反偏, 灯永远不亮。\\[4pt] \textit{本图用 \texttt{\textbackslash Expect} 断言了 PD1/D2/LED1 两端落网, 能抓「接到错的节点」; 但「同一元件两端接反」抓不住 —— 见 COMPARISON.md。}}
+
+\Anno{ann, align=left, anchor=north west, text width=7.2cm}{(8.4,-17.4)}{\textbf{取值理由}\\[3pt] R1 = 10K：暗态把分压点抬到近 3.3V。\\ R2 = 1K：$I_b=(3.3-0.7)/1\text{K}\approx2.6$mA, 取 $\beta$=100 可带 260mA。\\ R3 = 1K：5V, $V_f\approx1.9$V → $I\approx3$mA。\\ R4/C1：转折 $\approx$160Hz, 压住市电灯光 100Hz 闪烁。\\ D2 = 1N4148：线圈断电反峰可达数百伏, 不接会打穿 Q1。\\ 传感域用 +3.3V（与 PA0 的 ADC 参考同域）；驱动域才用 +5V。}
+
+\DumpCanvas
+\end{tikzpicture}
+\end{document}

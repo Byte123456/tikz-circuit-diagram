@@ -1,0 +1,967 @@
+% =====================================================================
+%  stm32tikz.sty —— TikZ/circuitikz 画 STM32 接线图, 排版时顺手吐出网表
+% =====================================================================
+%  设计目标:
+%
+%    1. 端子坐标**绝不允许手填** —— 内置器件用 circuitikz 锚点,
+%       自绘器件用 TikZ 命名坐标。两者都在"几何定义处"算出来,
+%       调用点只给一个位置, 没有写偏移量的入口。
+%    2. **画线即记账** —— \Wire 先把两端解析成 pt 坐标, **用这同一组坐标**
+%       既画线又写侧车。图与日志共用一次解析, 结构上不可能脱节。
+%    3. 侧车 (.net) 是检查器**唯一**的数据源 —— 检查器不解析 SVG/PDF 几何。
+%       这绕开了"渲染成 SVG 再正则反推坐标"那条路: 实测 dvisvgm/pdftocairo
+%       的产物只有 <path>+matrix(没有 <line>/<rect>), 且 dvisvgm 换字体格式
+%       会整体丢几何(`--no-fonts` 出 2 条 path, `--font-format=woff2` 出 0 条)。
+%
+%  侧车记录格式（纯文本, 每行一条, 字段用 | 分隔; 坐标单位 pt）:
+%
+%    W|x1|y1|x2|y2                     导线线段
+%    J|x|y                             结点(交叉处要连通就得画它)
+%    T|元件名.端子名|x|y                元件端子
+%    B|元件名|x0|y0|x1|y1               元件**本体**实心盒(不含标签/引线)
+%    P|网络名|x|y                       电源/地符号端子(它自己就是网络名)
+%    G|标签号|x|y                       网络标签(同号相连)
+%    E|元件名.端子名|目标                期望: 该端子应与"目标"同网
+%    #|...                             注释/统计, 检查器忽略
+%
+%  检查器 check_tex_net.py 用并查集规则还原网表并报错。
+%  关键一条: **端点相接才算连通; 中途交叉不算** —— 除非交点处
+%  登记了结点 J。
+% =====================================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{stm32tikz}[2026/09/25 v1.0 TikZ wiring diagram + sidecar netlist]
+
+\RequirePackage{tikz}
+\usetikzlibrary{calc, positioning}
+\RequirePackage{circuitikz}
+\RequirePackage{xcolor}
+\RequirePackage{pgffor}
+\RequirePackage{amsmath}      % \text{} 用在标注里的公式
+
+% ---------------------------------------------------------------- 配色
+\definecolor{wirec}{HTML}{37474F}
+\definecolor{vc}{HTML}{C62828}
+\definecolor{gndc}{HTML}{37474F}
+\definecolor{resc}{HTML}{1565C0}
+\definecolor{ledc}{HTML}{F9A825}
+\definecolor{npb}{HTML}{6A1B9A}
+\definecolor{dimc}{HTML}{546E7A}
+\definecolor{okc}{HTML}{2E7D32}
+
+\ctikzset{
+  bipoles/length=1.5cm,
+  resistors/scale=0.8,
+  capacitors/scale=0.85,
+  diodes/scale=0.78,
+  inductors/scale=0.7,
+  transistors/scale=0.95,
+}
+\tikzset{
+  every circuitikz/.style={line width=0.9pt, color=wirec},
+  wire/.style={draw=wirec, line width=1.1pt},
+  coilbox/.style={draw=npb, line width=0.9pt, fill=white,
+                  minimum width=1.05cm, minimum height=1.05cm},
+  ctact/.style={draw=npb, line width=1.0pt},
+}
+% 注: ann / annb 两个标注样式在**文件末尾**重新定义(带自动登记侧车的
+% 钩子)。这里不定义, 免得两处定义互相覆盖时看不出哪个生效。
+
+% ================================================================
+%  侧车文件 + 计数
+% ================================================================
+\makeatletter
+\newwrite\snet
+\immediate\openout\snet=\jobname.net
+\newcount\snwires   \snwires=0
+\newcount\snterms   \snterms=0
+\newcount\snbodies  \snbodies=0
+
+\newcommand\SNwrite[1]{\immediate\write\snet{#1}}
+
+% ---- \ShowNames: 把自动生成的**坐标名**打印出来 -----------------
+% 为什么需要: \Chain / \Bus / \MCU 会把前缀与键/引脚名拼成节点名, 拼法不是
+% 一眼可推的 —— `\Chain{LEDS}{...}{R3/R/1K}` 产出的是 `LEDSR3a`(前缀直接
+% 连写), 不是 `R3a`; \Bus 还会多出 `…tap`。写错就是一次编译失败往返。
+% 开了这个开关, 每个生成的名字都 \typeout 出来, 调用点不用猜。
+%
+% 默认**关**: 正常出图时一大串名字只是噪音。
+% 用法(画新图、或要引用某元件的锚点前先开一次):
+%     \ShowNames
+%     ...
+%     \Chain{LEDS}{ledStart}{1.6cm,0}{R3/R/1K, LED1/leD/{}}
+%     ...
+%     xelatex ... 2>&1 | grep 生成坐标名
+\newif\ifsnshownames \snshownamesfalse
+\newcommand\ShowNames{\snshownamestrue}
+% \SNname{名字}: 开着开关时既打到终端, 也写进侧车的 `N|` 记录。
+% ⚠ 不要想在这里写一条 `#` 开头的注释行: TeX 在任何宏定义体里看到**字面
+%   `#`** 都会当成参数符(即使后面跟的是空格), 报 "Illegal parameter number"。
+%   所以用 `N|` 这种真正的记录类型, 由 sidecar.py 显式忽略。
+\newcommand\SNname[1]{\ifsnshownames
+  \typeout{[stm32tikz] 生成坐标名: #1}%
+  \SNwrite{N|生成坐标名|#1}\fi}
+
+% --- 把任意点表达式解析成 pt 坐标 ---------------------------------
+% 支持: 节点名(R1end) / 节点.锚点(Q1.C) / 命名坐标 / 裸坐标(1cm,2cm) /
+% calc 表达式。统一落到一个 \coordinate 再取 center, 几种写法一套代码通吃。
+\newcommand\SNresolveTo[3]{%
+  \coordinate (@snpt) at (#1);%
+  \pgfpointanchor{@snpt}{center}\pgfgetlastxy{#2}{#3}%
+}
+
+% ================================================================
+%  基础 API
+% ================================================================
+
+% ---- \Wire{a}{b}: 画一段导线, 同时记账 -------------------------
+% **先解析、后画线, 两者共用同一组坐标** —— 这是"图与日志不可能脱节"的
+% 结构性保证, 而不是靠纪律。零长线段直接跳过(无意义)。
+%
+% ⚠ 这个宏**不检查正交** —— 斜线它照画不误, 而斜线会被网表检查器静默
+%   忽略(见下面 \WireH/\WireV 的说明)。所以画接线一律用 \WireH / \WireV;
+%   \Wire 只留给"两点本来就同 x 或同 y"的场合, 或确实需要斜线的装饰。
+\newcommand\Wire[2]{%
+  \SNresolveTo{#1}{\wax}{\way}%
+  \SNresolveTo{#2}{\wbx}{\wby}%
+  \draw[wire] (\wax,\way) -- (\wbx,\wby);%
+  \SNrecw{W}%
+}
+% ---- 零长线段的统一处理 ----------------------------------------
+% 端点重合("画"出来的是一条零长线)时**不记 W, 改记 M** —— 后者是记账警告,
+% 排版门会打印出来。
+%
+% 为什么值得报: 零长线在连通性上是无害的(两端本来就是同一个点), 但它意味着
+% 作者**以为两个点是分开的** —— 典型是 `\WireV{senseTop}{R1a}`, 而 senseTop
+% 就在 R1a 上。本目录的光敏图里真有一处这样, 是审计时抓出来的。它还会让
+% "导线条数"虚高, 且让两道门的计数对不上(电气门会过滤退化线, 排版门不滤)。
+% 静默吞掉就等于放过一次"接线意图与实际几何不符"。
+%
+% ⚠ 判据用 `\pgfmathparse`, **不要用 `\ifdim\wax=\wbx`** —— `\wax` 是
+%   `\pgfgetlastxy` 定义的宏(展开成 "0.0pt"), `\ifdim` 比这种宏来源的值
+%   行为不稳定(与 `\LogLabel` 那个坑同源, 见那边的对照实验)。这里一次
+%   `\pgfmathparse` 同时判两个轴, 少一次嵌套判断。
+\newcommand\SNrecw[1]{%
+  \pgfmathparse{abs(\wax-\wbx)>0.01 || abs(\way-\wby)>0.01}%
+  \ifnum\pgfmathresult=1
+    \global\advance\snwires by 1
+    \SNwrite{#1|\wax|\way|\wbx|\wby}%
+  \else
+    \SNwrite{M|零长导线(#1) 两端重合在 (\wax,\way) —— 多余的一行, 删掉即可(不影响连通性)}%
+  \fi
+}
+
+% ---- 正交意图标记 ----------------------------------------------
+% **斜线在连通性分析里没有定义** —— "两条线交叉算不算连"无从判定, 所以
+% 检查器只能把斜线整个丢掉。丢掉就意味着**漏检**: 一条斜着画出、两端没真
+% 接上的线, 会被当成不存在, 图看着连了、检查器说没问题。
+% 这是最隐蔽的一类漏检, 所以 \WireH/\WireV 会写下 H/V 意图由检查器核对。
+%
+% 所以 \WireH / \WireV 除了写 W 记录, 还写一条**意图记录**:
+%     WH|...  声明"这条应该是水平的"(抗辩式: 两端 y 必须相同)
+%     WV|...  声明"这条应该是竖直的"(两端 x 必须相同)
+% 由 check_tex_net.py 判定并报错(它还能打印出两端实际坐标与差值)。
+%
+% **为什么不在 TeX 里直接断言**: 试过, 不可靠。`\ifdim\sndiff>0.5pt` 在
+% \wax/\wbx 由 `\pgfgetlastxy` 定义(展开成 "91.04869pt" 这样的**宏**)时,
+% 行为不稳定 —— 实测同一个值既走进"超阈"分支又打印出差值 0.00003pt,
+% `\sndiff=-\sndiff` 取负也静默失效。TeX 的 dimen 算术对"寄存器 vs 展开
+% 宏"两套取值路径不做统一处理, 想要稳就得绕一大圈。
+% 检查器用 Python 算, 一遍过、可写回归测试, 而且报错信息能给全两端坐标。
+% 单点判定(哪个环节负责哪条规则)也比"两处各判一半"好维护。
+\newcommand\SNrecwH{%
+  \SNrecw{WH}%
+}
+\newcommand\SNrecwV{%
+  \SNrecw{WV}%
+}
+
+% ---- \WireH{a}{b}: 水平走线(声明两端同 y) ---------------------
+\newcommand\WireH[2]{%
+  \SNresolveTo{#1}{\wax}{\way}%
+  \SNresolveTo{#2}{\wbx}{\wby}%
+  \draw[wire] (\wax,\way) -- (\wbx,\wby);%
+  \SNrecwH
+}
+% ---- \WireV{a}{b}: 竖直走线(声明两端同 x) ---------------------
+\newcommand\WireV[2]{%
+  \SNresolveTo{#1}{\wax}{\way}%
+  \SNresolveTo{#2}{\wbx}{\wby}%
+  \draw[wire] (\wax,\way) -- (\wbx,\wby);%
+  \SNrecwV
+}
+
+% ---- \Junction{点}: 结点(交叉连通标记) ------------------------
+% 交叉的两条线默认**不连通** —— 只有画了结点才算连上。
+% T 型接头(端点落在另一条线上)由检查器的"端点相接"规则自动连通, 不需要它。
+\newcommand\Junction[1]{%
+  \SNresolveTo{#1}{\wax}{\way}%
+  \fill[wirec] (\wax,\way) circle (1.7pt);%
+  \SNwrite{J|\wax|\way}%
+}
+
+% ---- \RowAt{新坐标名}{参考点}{x}: 取参考点的 **y**, 配一个新的 x ----
+% ---- \ColAt{新坐标名}{参考点}{y}: 取参考点的 **x**, 配一个新的 y ----
+% 解决的是"同一个 y 在源码里写好几次"这件事。示例图里的老写法:
+%     \cRes{R4}{3.4,-3.9}{5.5,-3.9}{10K}      % -3.9 = 参考行, 手抄两遍
+%     \cRes{R5}{8.0,-3.9}{9.5,-3.9}{10K}      % 再抄两遍…
+% 一旦要挪这一行, 得找出全部 -3.9 逐个改; 漏一处就错位, 而**错位几 pt 是
+% 看不出来的**(不压字、不重叠, 排版门一条都不报)。
+% 改写成:
+%     \RowAt{r4L}{adcRow}{3.4}    \RowAt{r4R}{adcRow}{5.5}
+%     \cRes{R4}{r4L}{r4R}{10K}
+% 于是"这一行"只有一个定义处(r4L/r4R 都从 adcRow 取 y), 挪行只改 adcRow。
+%
+% ⚠ 实现上**不能**写成 `\coordinate (#1) at (#3,#2y)` 这种拼法 ——
+%   坐标里没法直接"取某个点的 y"。必须先把参考点解析成 pt 值
+%   (`\pgfpointanchor`), 再把它当**长度字面量**拼进新坐标。实测
+%   `\coordinate (n1) at (3.4,\ry)` 可行且精确(两处 y 完全相同, 同一个
+%   pt 值), 探针里验证过。
+%
+% ⚠ `\SNresolveTo` 内部是 `\pgfgetlastxy`, 它用 `\edef` **把参数定义成宏**
+%   (`\def\pgfgetlastxy#1#2{\edef#1{\the\pgf@x}...}`)。所以输出参数必须是
+%   **宏名**, 不能传 dimen 寄存器 —— 传寄存器会把它 `\edef` 成宏。
+%   要用寄存器就事后显式落一次(`\snrx=\rowx`), 下面就是这么写的。
+%   另一个坑: `\pgfgetlastxy` 的目标宏会被**下一次调用覆盖**, 所以先量参考点、
+%   再落成寄存器, 之后才敢拿去拼坐标。
+\newdimen\snrx \newdimen\snry
+\newcommand\RowAt[3]{%
+  \SNresolveTo{#2}{\rowx}{\rowy}%
+  \snry=\rowy
+  \coordinate (#1) at (#3,\snry);%
+  \SNname{#1 (行对齐: y 取自 #2)}%
+}
+\newcommand\ColAt[3]{%
+  \SNresolveTo{#2}{\colx}{\coly}%
+  \snrx=\colx
+  \coordinate (#1) at (\snrx,#3);%
+  \SNname{#1 (列对齐: x 取自 #2)}%
+}
+
+% ---- \Span{新名}{点A}{点B}: 取两点的 x/y 各一, 组成新坐标 ----
+% 例如"在 A 的竖线上、B 的行上"——这就是 `A |- B`, 保留它给习惯的人;
+% \Span 的用处是它同时**登记进侧车**(A |- B 是匿名的, 事后没法引用)。
+\newcommand\Span[3]{%
+  \coordinate (#1) at (#2 |- #3);%
+  \SNname{#1 (A |- B: 在 #2 的 x、#3 的 y 上)}%
+}
+
+% ---- \Term{元件名.端子名}{点}: 登记端子 ------------------------
+\newcommand\Term[2]{%
+  \SNresolveTo{#2}{\wax}{\way}%
+  \global\advance\snterms by 1
+  \SNwrite{T|#1|\wax|\way}%
+}
+
+% ---- \Body{元件名}{节点}: 登记本体实心盒 -----------------------
+% **踩过的坑**: TikZ 的 north west / south east 锚点**随节点一起旋转**。
+% 竖放的电阻用 .north west 拿到的是"旋转后的左上角", x 会跑到右边去
+% (实测 nw.x=+5.12 / se.x=-5.12, 盒子的 x 上下界整个反过来)。
+% 所以改成: 取 center/north/south/east/west 五个锚点求**轴对齐并集**。
+% north/south 落在长轴、east/west 落在垂直方向, 两者并起来正好是本体 AABB,
+% 而且对任意旋转都成立 —— 不需要任何标定表。
+\newdimen\snmnx \newdimen\snmxx \newdimen\snmny \newdimen\snmxy
+\def\SNacc{%
+  \ifdim\ax<\snmnx \global\snmnx=\ax \fi
+  \ifdim\ax>\snmxx \global\snmxx=\ax \fi
+  \ifdim\ay<\snmny \global\snmny=\ay \fi
+  \ifdim\ay>\snmxy \global\snmxy=\ay \fi
+}
+\newcommand\Body[2]{%
+  \pgfpointanchor{#2}{center}\pgfgetlastxy{\ax}{\ay}%
+  \global\snmnx=\ax \global\snmxx=\ax \global\snmny=\ay \global\snmxy=\ay
+  \pgfpointanchor{#2}{north}\pgfgetlastxy{\ax}{\ay}\SNacc
+  \pgfpointanchor{#2}{south}\pgfgetlastxy{\ax}{\ay}\SNacc
+  \pgfpointanchor{#2}{east}\pgfgetlastxy{\ax}{\ay}\SNacc
+  \pgfpointanchor{#2}{west}\pgfgetlastxy{\ax}{\ay}\SNacc
+  \global\advance\snbodies by 1
+  \SNwrite{B|#1|\the\snmnx|\the\snmny|\the\snmxx|\the\snmxy}%
+}
+
+% ---- \BodyBox{元件名}{角1}{角2}: 直接给两个对角点登记本体盒 -----
+% 给"没有现成旋转无关锚点"的自绘器件(触点这类细线图形)用。
+% 两个角点仍必须是命名坐标/锚点 —— 不允许裸写数字。
+\newcommand\BodyBox[3]{%
+  \SNresolveTo{#2}{\bax}{\bay}%
+  \SNresolveTo{#3}{\bbx}{\bby}%
+  \global\advance\snbodies by 1
+  \SNwrite{B|#1|\bax|\bay|\bbx|\bby}%
+}
+
+% ---- \DumpCanvas: 登记画布范围 ---------------------------------
+% 在 \end{tikzpicture} **之前**调用一次。排版门的"器件越界"需要它 ——
+% 从 TikZ 的 current bounding box 读 —— 这是**排版时**的真实范围,
+% 含 standalone 的裁剪意图, 比事后从渲染产物反推准。
+\newcommand\DumpCanvas{%
+  \pgfpointanchor{current bounding box}{south west}\pgfgetlastxy{\wax}{\way}%
+  \pgfpointanchor{current bounding box}{north east}\pgfgetlastxy{\wbx}{\wby}%
+  \SNwrite{C|\wax|\way|\wbx|\wby}%
+}
+
+% ---- 电源/地符号的**图形范围**登记 -----------------------------
+% 为什么要单独做: \Power 的 P| 只记**一个连接点**。而"文字压在接地符号上"
+% 这类问题要用**图形范围**才能查出来 —— 一个端点代表不了一个符号, 与器件
+% 本体盒是同一个道理。
+%
+% 踩过的坑(目视发现, 两道门全报 0): C1 的接地符号在 (284.5,-187.8), 而
+% "D2 1N4148 续流" 的标注盒是 x 263..337 y -209..-194 —— 地符号的横杠和
+% 竖线正好落在这个盒里, 字被符号压着。P| 拿一个点跟文字盒比, 永远比不出
+% 重叠来。
+%
+% 分工: \SNgnew 先要一个**唯一编号**; \cGND/\cVCC 用这个编号给节点命名;
+% \SNgbbox 再按那个名字量盒。分两步是因为**名字得在 \node 之前知道**。
+% ⚠ 名字里不能有中文/点号(pgf 会把中文当数学函数解析)。
+\newcount\sngsno \sngsno=0
+\newcommand\SNgnew{\global\advance\sngsno by 1}
+\newdimen\gsmx \newdimen\gsxx \newdimen\gsmy \newdimen\gsxy
+\def\SNgsacc{%
+  \ifdim\ax<\gsmx \global\gsmx=\ax \fi
+  \ifdim\ax>\gsxx \global\gsxx=\ax \fi
+  \ifdim\ay<\gsmy \global\gsmy=\ay \fi
+  \ifdim\ay>\gsxy \global\gsxy=\ay \fi
+}
+% \SNgbbox{节点名}{网络名}: 取 center/north/south/east/west 的并集当图形盒。
+% 与 \Body 同一套办法 —— 四方向并集对任意旋转都成立, 不需要标定表。
+\newcommand\SNgbbox[2]{%
+  \pgfpointanchor{#1}{center}\pgfgetlastxy{\ax}{\ay}%
+  \global\gsmx=\ax \global\gsxx=\ax \global\gsmy=\ay \global\gsxy=\ay
+  \pgfpointanchor{#1}{north}\pgfgetlastxy{\ax}{\ay}\SNgsacc
+  \pgfpointanchor{#1}{south}\pgfgetlastxy{\ax}{\ay}\SNgsacc
+  \pgfpointanchor{#1}{east}\pgfgetlastxy{\ax}{\ay}\SNgsacc
+  \pgfpointanchor{#1}{west}\pgfgetlastxy{\ax}{\ay}\SNgsacc
+  \SNwrite{GS|#2|\the\gsmx|\the\gsmy|\the\gsxx|\the\gsxy}%
+}
+
+% ---- \Power{网络名}{点}: 电源/地符号的连接点 -------------------
+% 它本身就是一个网络名: 多个同名符号自动
+% 并成一张网, 不需要导线连起来。图形范围另由 GS| 记(见上)。
+\newcommand\Power[2]{%
+  \SNresolveTo{#2}{\wax}{\way}%
+  \SNwrite{P|#1|\wax|\way}%
+}
+
+% ---- \NetTag{号}{点}: 网络标签(同号相连) ----------------------
+\newcommand\NetTag[2]{%
+  \SNresolveTo{#2}{\wax}{\way}%
+  \SNwrite{G|#1|\wax|\way}%
+}
+
+% ---- \Expect{元件名.端子名}{目标}: 声明"该端子应在哪张网" -------
+% 唯一能抓「接到错的节点上」的手段 —— 接错节点时端子照样接上了导线,
+% 短路/旁路/穿体/悬空全都不报, 只有把(实际网)与(期望网)比一次才发现。
+% 目标可写 "网络名"(+5V/GND) 或 "元件名.端子名"(K1.b)。
+\newcommand\Expect[2]{\SNwrite{E|#1|#2}}
+
+\newcount\snannos \snannos=0
+% 自动等距用的寄存器(\MCUauto): 间距 / 引脚数 / 当前偏移
+\newdimen\snpitch \newdimen\snoff
+\newcount\snnum
+% \Anno{样式}{位置}{文字}: 显式标注, **带文字**登记。
+% 报错信息里能出现原文, 比自动登记只有编号好读得多 —— 所以正文标注
+% 一律用它; `ann` 样式的自动登记只是"兜底"(防止有人直接写 \node[ann])。
+% 为避免与自动登记重复, 这里把两个钩子都清空(名字自己给)。
+%
+% ⚠ \Anno 的**位置参数要带外层括号**(与 \WireH/\WireV 相反):
+%   因为 calc 表达式 $(A)+(0,1cm)$ 必须连着外层括号一起给 TikZ。
+%   三种写法都支持:
+%     \Anno{ann}{(1,2)}{文字}              裸坐标(自带括号)
+%     \Anno{ann}{($(A)+(0,1cm)$)}{文字}    calc 表达式
+%     \Anno{ann}{(A)}{文字}                命名坐标
+%   这是全线唯一"位置要写括号"的宏, 因为它直接转交给 \node ... at。
+%
+% ⚠ 文字写出前必须 `\detokenize`。踩过的坑: \Anno 的文本里可以有
+%   \textbf{}/数学式/`\\` 换行 —— 直接 \write 出去时 TeX 会在写文件阶段
+%   **展开**它们, 碰到 `\\` 或未定义序列就报
+%   "Emergency stop / <inserted text> }\endwrite"。\detokenize 把整段变成
+%   逐字文本, 写出的就是原样源码, 也不会因缺字告警。
+%   (副作用: 侧车里看到的是 LaTeX 源码如 \textbf{反偏}, 不是渲染后文字 ——
+%    报错定位用足够了, 而且反而更容易 grep 回 .tex 原文。)
+%
+% ⚠ 必须**挡住 ann 样式的自动登记**: \Anno 的样式串里带着 "ann", 于是
+%   `/utils/exec` 与 `execute at end node` 两个钩子都会触发, 同一个标注
+%   被登记两次(一次带文字、一次只有编号), 排版门报一堆"与自己重叠"。
+%   用标志位挡最稳 —— 试过在 \node 选项里写 `/utils/exec={}` 覆盖, 但
+%   样式串在前、覆盖在后, pgfkeys 的处理顺序不保证按预期生效。
+\newif\ifsnnoauto \snnoautofalse
+\newcommand\Anno[3]{%
+  \global\advance\snannos by 1
+  \snnoautotrue
+  \node[#1, name=snanno\the\snannos] at #2 {#3};%
+  \snnoautofalse
+  \pgfpointanchor{snanno\the\snannos}{south west}\pgfgetlastxy{\tax}{\tay}%
+  \pgfpointanchor{snanno\the\snannos}{north east}\pgfgetlastxy{\tbx}{\tby}%
+  \SNwrite{X|\the\snannos|R|\tax|\tay|\tbx|\tby|\detokenize{#3}}%
+}
+
+% ---- 标注偏移自动化: \AnnoAt / \AnnoOff -------------------------
+% 为什么要它: 手工摆标注是当前**唯一**的大宗往返 —— 排版门报"把该标注
+% 上移 ≥21.9pt", 得有人把这个数换算成 cm 再回去改源码。改动本身机械,
+% 于是交给机器。
+%
+% 做法: 标注**锚在哪**(参考点)与**相对它的偏移**分开。偏移不再是源码里的
+% 数字, 而是从 `auto_offsets.tex` 读的**数据** —— 于是"算偏移"这件事就
+% 可以写成 Python(place.py), 不需要重新发明排版器:
+%
+%     第一遍  xelatex          偏移全为 0, 标注叠在锚点上
+%             ↓ 侧车 A| 记录 = 每个标注的锚点坐标 + 文字盒 + 想要的角次序
+%             place.py        按角次序试位, 找不压线/不压字/不压器件的位置
+%             ↓ 写出 auto_offsets.tex
+%     第二遍  xelatex          偏移生效
+%
+% 为什么这能自动收敛(而"让 TeX 自己找位"不行): 偏移是**显式数据**。
+% TeX 自找位要在图末拿全部盒再重新排版试探, 挪一个标注可能牵动整图;
+% 这里改的是第二遍的输入, 几何本身不动, 所以每遍都是确定的。
+%
+% ⚠ **偏移只在 calc 里用**, 所以展开必须干净: 用 `\csname` 直接取宏
+%   (`\ifcsname...\csname...\endcsname\else 0pt,0pt\fi`), **不要用
+%   `\expandafter\let`** —— `\let` 不是可展开命令, 在坐标解析里会出问题。
+%
+% ⚠ 宏名**不带 `@`**: 偏移文件是在正文里 `\input` 的, 那时 `@` 不是字母,
+%   `sn@ao@xxx` 会被当成 `sn` `@` `ao` … 拼成错误的 csname。用 `snao<键>`。
+\newcommand\AnnoOff[1]{%
+  \ifcsname snao#1\endcsname \csname snao#1\endcsname \else 0pt,0pt\fi}
+% 偏移文件不存在也不报错 —— 第一遍本来就没有它。
+\newcommand\InputAnnoOffsets[1]{\IfFileExists{#1}{\input{#1}}{}}
+
+% \AnnoAt{键}{样式}{参考点}{角次序}{文字}
+%   键     ASCII, 只用 [a-z0-9_]; **改了键就等于换一个标注**, 旧偏移会丢。
+%           所以键名要跟着标注的**内容**走(pd1k / r1name / mcu_caption…),
+%           而不是位置, 免得挪了标注键名就失去意义。
+%   参考点 是**锚点**, 不带括号: PD1.west / R1.south / ledA / (3,2)。
+%           `\Anno` 那个"位置参数要带括号"的例外在这里**不适用**。
+%   角次序 标注往参考点的哪个方向摆 —— west / east / north / south /
+%           north west / … 的**逗号表**, **按序试**。place.py 从第一个能放下的
+%           开始用; 全放不下就按比例拉远再试。给多个候选项能显著提高一次
+%           收敛率: 实心元件左上方挤, west 不行时 east 往往就有位置。
+%           写 `{}` 表示只按比例拉远、不换方向(适合"必须在这侧"的标注)。
+%   样式   只给字形/对齐, **不要写 anchor= / name=** —— anchor 由摆位决定,
+%           写了它 place.py 会判定该标注不参与自动摆位(并在报告里说出来)。
+%
+% ⚠ 这个宏**同时写 X| 和 A| 两条记录**:
+%   X| 给排版门(它只认文字盒, 与 \Anno 一致);
+%   A| 给 place.py(带锚点、键、角次序、当前盒)。
+\newcommand\AnnoAt[5]{%
+  \SNresolveTo{#3}{\aaX}{\aaY}%
+  \global\advance\snannos by 1
+  \snnoautotrue
+  % 位置算在**解析出的绝对坐标** `(\aaX,\aaY)` 上, 而不是把 `#3` 原样塞进
+  % calc。这样参考点写成节点锚点(R1.west)、命名坐标(ledA)、裸坐标(3,2)
+  % 三种都可以, 不用各判一次; `\aaX/\aaY` 是 `\pgfgetlastxy` 出来的 pt 值,
+  % 当坐标字面量用永远合法。
+  \node[#2, name=snanno\the\snannos, anchor=center]
+       at ($(\aaX,\aaY)+(\AnnoOff{#1})$) {#5};%
+  \snnoautofalse
+  \pgfpointanchor{snanno\the\snannos}{south west}\pgfgetlastxy{\tax}{\tay}%
+  \pgfpointanchor{snanno\the\snannos}{north east}\pgfgetlastxy{\tbx}{\tby}%
+  % X| 的文字前面缀上**键名**, 排版门报错时就能直接点名"改哪个键"
+  % (place.py 只用 A|, 不看 X|; 这里加键名纯粹是给人看的)。
+  \SNwrite{X|\the\snannos|R|\tax|\tay|\tbx|\tby|[\detokenize{#1}] \detokenize{#5}}%
+  % A| 记录是 place.py 的输入: 键 / 编号 / 锚点坐标 / 角次序 / 当前盒。
+  % 当前盒同时给出两个信息: 文字尺寸(宽高) 与"上次摆在哪"(盒中心 − 锚点)。
+  % 第一遍没有偏移文件时偏移为 0, 盒中心正好落在锚点上 —— 尺寸照样拿得到,
+  % 所以**不需要单独记一次尺寸**。
+  \SNwrite{A|#1|\the\snannos|\aaX|\aaY|#4|#2|\detokenize{#3}|\tax|\tay|\tbx|\tby|\detokenize{#5}}%
+}
+
+% ---- \AnnoPack{键}{样式}{列顶}{文字}: 多行说明块的自动堆叠 ----
+% 解决的是: `\Anno`(整块多行说明)**位置只能手猜**, 而块很高(实测两块
+% 122.8pt / 229.1pt), 猜错就互相压住 —— 本次实测两块互压 235pt, 其中一块
+% 还坐在 GND 符号上; 修法是手猜新坐标, 猜中了。那是纯 guess→build→check,
+% 占用了 3 次 build 里的 2 次。
+%
+% 为什么不能直接用 `\AnnoAt`: 说明块**没有元件锚点**(它是版式文字, 不"属于"
+% 某个器件), 而 `\AnnoAt` 的模型是"相对锚点朝某方向偏移"。说明块要的是
+% **一列里顺序堆叠**。
+%
+% 做法: 给一个**列 x** 与**列顶 y**(= 第一块的锚点), 块在列里按真实高度
+% 依次往下排。place.py 读侧车拿到每块的真实高度后, 把偏移写成
+% `snao<键>` —— 复用 `\AnnoAt` 那套偏移机制, 不引入新概念。
+% 键不带列语义: 同一列的块只要**共用同一个列顶坐标**即可(见 `\PackColumn`)。
+%
+% 用法:
+%   \coordinate (noteCol) at (9.7,-15.4);     % 列顶
+%   \AnnoPack{note1}{ann, align=left, text width=8.2cm}{noteCol}{第一块...}
+%   \AnnoPack{note2}{ann, align=left, text width=8.2cm}{noteCol}{第二块...}
+%   → place.py 把 note1 放列顶、note2 按 note1 的实际高度接在下面
+%
+% ⚠ 样式里**不要写 anchor=** —— 堆叠按 `north west` 对齐(列的左边界),
+%   写了 anchor 会让列对不齐。样式里只给字形/对齐/text width。
+%
+% ⚠ 与 `\AnnoAt` 一样, 位置算在**解析出的绝对坐标**上, 参考点可以是命名
+%   坐标或节点锚点, **不带外层括号**。
+\newcommand\AnnoPack[4]{%
+  \SNresolveTo{#3}{\aaX}{\aaY}%
+  \global\advance\snannos by 1
+  \snnoautotrue
+  \node[#2, name=snanno\the\snannos, anchor=north west]
+       at ($(\aaX,\aaY)+(\AnnoOff{#1})$) {#4};%
+  \snnoautofalse
+  \pgfpointanchor{snanno\the\snannos}{south west}\pgfgetlastxy{\tax}{\tay}%
+  \pgfpointanchor{snanno\the\snannos}{north east}\pgfgetlastxy{\tbx}{\tby}%
+  \SNwrite{X|\the\snannos|R|\tax|\tay|\tbx|\tby|[\detokenize{#1}] \detokenize{#4}}%
+  % A| 记录: 角次序字段写 `PACK` 作为标记 —— place.py 据此走"列内堆叠"分支,
+  % 而不是"按方向试位"。列 x 就是锚点 x, 列顶就是锚点 y。
+  \SNwrite{A|#1|\the\snannos|\aaX|\aaY|PACK|#2|\detokenize{#3}|\tax|\tay|\tbx|\tby|\detokenize{#4}}%
+}
+
+% ---- 自动登记所有 ann/annb 标注（无需改调用点） ----------------
+% \Anno 要调用方显式改写法; 但"漏登记一个标注"就会让排版门**看不见**它,
+% 那正是最该怕的漏检模式(不是"查了没问题", 是"压根没看")。
+% 所以这里让 ann / annb 这两个样式**自己**登记: 只要用了它们, 一定进侧车。
+%
+% 关键机制(实测): `/utils/exec` 在选项处理阶段**立即**执行, 早于 `name=`
+% 展开 —— 所以能在命名前把计数器 +1, 编号从 1 开始且不断档。
+% `execute at begin node` 做不到(那时 `name=` 已经定型, 改名不生效)。
+%
+% 说明: 自动登记**不带文字**(TikZ 不把节点文本留成可读宏), 报错时显示
+% "标注#3" 加坐标; 需要报错里出现原文就用 \Anno。
+\def\snnodes{}
+\def\SNannoreg#1{\ifsnnoauto\else\xdef\snnodes{\snnodes,#1}\fi}
+\def\SNannodump{%
+  \foreach \nm in \snnodes{%
+    \ifx\nm\empty\else
+      \pgfpointanchor{\nm}{south west}\pgfgetlastxy{\tax}{\tay}%
+      \pgfpointanchor{\nm}{north east}\pgfgetlastxy{\tbx}{\tby}%
+      \SNwrite{X|\nm|A|\tax|\tay|\tbx|\tby|标注\nm}%
+    \fi}}
+\tikzset{
+  ann/.style={font=\small, text=dimc,
+    /utils/exec={\ifsnnoauto\else\global\advance\snannos by 1 \fi},
+    name=snanno\the\snannos,
+    execute at end node={\SNannoreg{snanno\the\snannos}}},
+  annb/.style={font=\small\bfseries, text=black,
+    /utils/exec={\ifsnnoauto\else\global\advance\snannos by 1 \fi},
+    name=snanno\the\snannos,
+    execute at end node={\SNannoreg{snanno\the\snannos}}},
+  % 所有图都自动 dump 一遍标注盒
+  every picture/.append style={execute at end picture=\SNannodump},
+}
+
+% ---- \LogLabel{元件名}: 登记 circuitikz 的**值标签**排版盒 -----------
+% 实测 circuitikz 给每个带 `l=`/`v=` 的元件生成了一个 `⟨名⟩label` 节点,
+% 并且它就是个可量锚点的 pgf node。所以不用改画图代码, 事后一句话就能把
+% "10K"/"100nF" 这些标签的真实盒收进侧车。
+% **不能靠估算**: 中英混排加数学式的宽度估不准, 而排版门要拿它判重叠。
+% 用法: \LogLabel{R1}  —— 写在元件声明之后(必须在同一张图里)。
+\newcommand\LogLabel[1]{%
+  \ifcsname pgf@sh@ns@#1label\endcsname
+    \pgfpointanchor{#1label}{south west}\pgfgetlastxy{\tax}{\tay}%
+    \pgfpointanchor{#1label}{north east}\pgfgetlastxy{\tbx}{\tby}%
+    % **零面积盒直接跳过**: \Chain/\Bus 为了"值为空时不标"统一写 `l={\v}`,
+    % 空值会让 circuitikz 生成一个没有内容的 label 节点(盒面积 0)。把它写进
+    % 侧车会让排版门看到一堆"零宽文字盒", 既没意义又可能报假重叠。
+    %
+    % ⚠⚠ 判据**必须用 \pgfmathparse, 不能用 \ifdim 比 \pgfgetlastxy 的结果**。
+    %   这是本文件里最隐蔽的一个坑, 被基准测试的 subagent 抓出来了:
+    %   `\tax`/`\tbx` 是 `\pgfgetlastxy` 定义的**宏**(展开成 "10.26pt")。
+    %   把两个这样的值放进 dimen 寄存器再用 `\ifdim` 比, 单次调用正常, 但
+    %   **连续调用会静默失效** —— 实测三次同构调用只有第一次写出记录,
+    %   后两次一声不响地跳过(连 `M|` 警告都没有, 因为 `\ifcsname` 是通过的)。
+    %   后果极其危险: 值标签全部没进侧车, 而排版门报 0 问题 ——
+    %   不是"查了没问题", 是"**压根没看**"。本目录的示例图一度就这样,
+    %   修好之后当场报出 5 处以前看不见的文字重叠。
+    %   对照实验(三次同构调用)的写入成功率:
+    %       \ifdim + \dimen0/\dimen2     1/3   ← 原实现, 已废弃
+    %       \ifdim + \newdimen 私有寄存器 1/3   ← 换寄存器救不了
+    %       \pgfmathparse                3/3   ← 采用
+    %   同一个坑在 `\WireH`/`\WireV` 处也踩过(那边改用 Python 侧判定绕开)。
+    \pgfmathparse{(\tbx-\tax)>0.5 && (\tby-\tay)>0.5}%
+    \ifnum\pgfmathresult=1
+      \global\advance\snannos by 1
+      \SNwrite{X|\the\snannos|L|\tax|\tay|\tbx|\tby|#1 值标签}%
+    \fi
+  \else
+    % 没有 label 节点: 可能是该元件确实没写 l=/v=, 也可能是名字拼错。
+    % 两种情况都不该**静默** —— 拼错名字是很容易犯又很难看出的错
+    % (值标签没出现在侧车里, 排版门就看不到它, 于是可能压线也不报)。
+    \SNwrite{M|#1|没有 label 节点: 该元件未写 l=/v=, 或元件名拼错}%
+  \fi
+}
+
+% ================================================================
+%  内置器件: 画 + 自动登记端子/本体
+% ================================================================
+% 端子名统一 .a(线起点) / .b(线终点)。**不用 .l/.r/.t/.b** —— 那四个会随
+% 摆放方向改变含义, 调用点写错时"端子还在、只是接错边", 很难发现;
+% .a/.b 恒定对应画线的起点/终点, 与电路图阅读顺序一致。
+%
+% ⚠ **器件名必须是 ASCII**（R1 / D2 / K1 …）。踩过的坑: \pgfpointanchor
+%   解析 `K1线圈.t` 时把中文当成了数学函数名, 报
+%   `Unknown function 't'`。中文只放**显示标签**(l= 或独立 annotate 节点),
+%   网表里的键保持 ASCII —— 显示标签与端子名分开, 混用会让锚点解析失败。
+%
+% circuitikz 的方向语义(实测):
+%   R/C  : a=start, b=end            (双向元件, 无极性)
+%   D/leD/photodiode: **a = 阳极(+), b = 阴极(-)** —— 三角形由 a 指向 b
+%   所以"阴极朝上"就要**从下往上画**(起点在下方)。
+%
+% \cPart{元件名}{circuitikz 键}{起点}{终点}{选项}
+\newcommand\cPart[5]{%
+  \draw (#3) to[#2, name=#1, #5] (#4);%
+  \Term{#1.a}{#1start}\Term{#1.b}{#1end}\Body{#1}{#1}%
+  \coordinate (#1a) at (#1start);%
+  \coordinate (#1b) at (#1end);%
+  \SNname{#1 / #1a / #1b / #1start / #1end}%
+}
+\newcommand\cR[3]{\cPart{#1}{R}{#2}{#3}{}}
+\newcommand\cC[3]{\cPart{#1}{C}{#2}{#3}{}}
+\newcommand\cD[3]{\cPart{#1}{D}{#2}{#3}{}}
+\newcommand\cLED[3]{\cPart{#1}{leD}{#2}{#3}{}}
+\newcommand\cPD[3]{\cPart{#1}{photodiode}{#2}{#3}{}}
+\newcommand\cL[3]{\cPart{#1}{L}{#2}{#3}{}}
+\newcommand\cSW[3]{\cPart{#1}{switch}{#2}{#3}{}}
+% 带阻值标注的电阻 / 电容
+\newcommand\cRes[4]{\cPart{#1}{R}{#2}{#3}{l=#4}}
+\newcommand\cCap[4]{\cPart{#1}{C}{#2}{#3}{l=#4}}
+
+% \cNPN{名}{位置}: anchor=B 落在给定点; 端子 .b/.c/.e
+\newcommand\cNPN[2]{%
+  \node[npn, anchor=B, name=#1] at (#2) {};%
+  \Term{#1.b}{#1.B}\Term{#1.c}{#1.C}\Term{#1.e}{#1.E}%
+  \Body{#1}{#1}%
+  \coordinate (#1b) at (#1.B);%
+  \coordinate (#1c) at (#1.C);%
+  \coordinate (#1e) at (#1.E);%
+  \SNname{#1 / #1b / #1c / #1e}%
+}
+
+% \cGND{点} / \cVCC{标签}{点}
+% 节点名**由 \Power 内部的计数器给出**(同一图里会有多个 vcc/ground, 用固定
+% 名字会互相覆盖), 位置由参数直接给出。命名是必要的 —— 不命名就只能拿到
+% 一个坐标点, 量不到符号的图形范围, 于是"文字压在接地符号上"永远查不出
+% (详见 \Power 的注释)。
+\newcommand\cGND[1]{%
+  \SNgnew
+  \node[ground, name=sngnd\the\sngsno] at (#1) {};%
+  \SNgbbox{sngnd\the\sngsno}{GND}%
+  \Power{GND}{#1}%
+}
+\newcommand\cVCC[2]{%
+  \SNgnew
+  \node[vcc, name=snvcc\the\sngsno] at (#2) {\small #1};%
+  \SNgbbox{snvcc\the\sngsno}{#1}%
+  \Power{#1}{#2}%
+}
+
+% ================================================================
+%  自绘器件
+% ================================================================
+% 端子一律用**命名坐标**, 在定义器件的那一刻由几何算出 —— 与绘制代码写在
+% 同一处, 不会各改各的。这是 [飘端子] 那一类缺陷的根因 ——
+% 若端子靠作者手填绝对坐标, 它与绘制代码之间就没有一致性约束,
+% 在这里从结构上消失。
+
+% ---- 继电器线圈: 矩形节点, 端子 = 上下边中点 -------------------
+% \CoilNode{名(ASCII)}{中心}{显示文字}
+% 显示文字单独给 —— 节点名必须是 ASCII(见上文 \pgfpointanchor 的坑),
+% 中文走 label。
+\newcommand\CoilNode[3]{%
+  \node[coilbox, name=#1] at (#2) {\small #3};%
+  \Term{#1.t}{#1.north}\Term{#1.b}{#1.south}%
+  \Body{#1}{#1}%
+  \coordinate (#1t) at (#1.north);%
+  \coordinate (#1b) at (#1.south);%
+  \SNname{#1 / #1t / #1b}%
+}
+
+% ---- 继电器触点(常开): 两段折线 + 命名坐标 ---------------------
+% 公共端 com 在左下、常开端 no 在右下。张开 = 常开。
+% 端子/本体都登记在**命名坐标**上(不是节点锚点) —— 细线图形没有可用的
+% 旋转无关锚点, 用坐标最直接, 而且坐标就在这里定义, 调用点拿不到手填机会。
+% \Contacts{名}{中心}
+\newcommand\Contacts[2]{%
+  \begin{scope}[shift={(#2)}]%
+    \coordinate (#1com) at (-0.95cm,-0.62cm);
+    \coordinate (#1no)  at ( 0.95cm,-0.62cm);
+    \coordinate (#1top) at (-0.95cm,-0.10cm);
+    \coordinate (#1bot) at ( 0.95cm,-0.10cm);
+    \coordinate (#1TL)  at (-0.95cm, 0.14cm);
+    \coordinate (#1BR)  at ( 0.95cm,-0.62cm);
+    \draw[ctact] (#1com) -- (#1top);
+    \draw[ctact, line width=1.2pt] (#1top) -- (0.52cm,0.12cm);
+    \draw[ctact] (#1no) -- (#1bot);
+  \end{scope}
+  \Term{#1.com}{#1com}\Term{#1.no}{#1no}%
+  \BodyBox{#1}{#1TL}{#1BR}%  本体盒 = 两端子 + 上方杠杆所围的区域
+  \SNname{#1com / #1no / #1top / #1bot}%
+}
+
+% ================================================================
+%  MCU 方块
+% ================================================================
+% \MCU{名}{中心x}{中心y}{宽}{高}{说明}{引脚表}
+%   引脚表 = {PA0/0cm, PA1/-0.9cm}  (引脚名 / 相对中心 y 偏移)
+% 每个引脚: 从方块右边缘画一段引线到命名坐标(**名 = 前缀直接拼引脚名**,
+% 如 MCUPA0 —— 不用连字符/点, 那两种会被 pgf 当成数学表达式或锚点分隔符),
+% 引线**用 \Wire 画** —— 于是它自动记进侧车, 端子一定落在导线上,
+% 不会出现"端子挂在一条不存在的线上"引发的连锁误报。
+% 方块外框是装饰性围栏, **不记** W。
+%
+% ⚠ 引脚表省略偏移时**两种写法都坏**:
+%     `{PA0, PA1}`    → \pdy 回退成 \pname 本身("PA0"), 当坐标用会被当成
+%                       节点名去找, 报 `No shape named 'PA0'`;
+%     `{PA0/, PA1/}`  → 实测 pgffor 让空字段也回退(\pname==\pdy)。
+%   要精确控制就用下面的 \MCUauto, 或每个引脚都显式写偏移。
+\newcommand\MCU[7]{%
+  \coordinate (#1c) at (#2,#3);%
+  \coordinate (#1se) at ($(#1c)+(#4/2,-#5/2)$);%
+  \coordinate (#1nw) at ($(#1c)+(-#4/2,#5/2)$);%
+  \draw[wire] (#1nw) rectangle (#1se);%
+  \node[annb, font=\small\bfseries] at ($(#1c)+(0,#5/2+0.40cm)$) {#1};%
+  \node[ann, font=\footnotesize] at ($(#1c)+(0,-#5/2-0.34cm)$) {#6};%
+  \foreach \pname/\pdy in {#7}{%
+    \coordinate (#1\pname) at ($(#1c)+(#4/2+0.85cm,\pdy)$);%
+    \Wire{$(#1c)+(#4/2,\pdy)$}{#1\pname}%
+    \node[ann, font=\footnotesize, anchor=south east]
+      at ($(#1c)+(#4/2-0.10cm,\pdy+0.10cm)$) {\pname};%
+    \Term{#1.\pname}{#1\pname};%
+  }%
+  \SNname{#1nw / #1se / #1c / 每个引脚: #1<引脚名>}%
+}
+
+% ---- \MCUauto{名}{x}{y}{宽}{高}{说明}{间距}{引脚列表} -----------
+% 与 \MCU 同样的 7 个参数, 只是把"引脚表(名/偏移)"换成"间距 + 引脚名列表":
+% 引脚**只给名字**, y 偏移由间距自动等距、整体居中。
+%
+% 为什么要它: 手填 y 偏移有两个毛病 ——
+%   1. 引脚一多, 每加一个就要重算全部偏移(否则间距不匀);
+%   2. 手算的偏差是**看不出来的**: 差 3pt(1mm) 在图上就是"引脚有点不齐",
+%      但不压字、不重叠, 排版门一条都不报。
+% 自动等距把这个数字从源码里彻底去掉, 于是那类偏差**不可能发生**。
+%
+% 用法:
+%   \MCUauto{MCU}{-1.2}{-12.2}{3.0cm}{3.4cm}{STM32F103C8T6 · 控制域}{0.9cm}
+%     {\PinADC, \PinDrive}
+%   → 两个引脚落在 ∓0.45cm; 三个引脚落在 -0.9/0/+0.9cm
+%
+% 要与别的器件对行时, 引脚坐标 `MCU<引脚名>` 是现成的锚点, 用
+% `A |- MCU<引脚名>` 取交点即可 —— 不要手算 y。
+%
+% ⚠ 尺寸算术的写法有硬要求(实测): `\dimexpr` 里**不能出现括号**,
+%   `(\snc-1)*\snp` 会报 "Illegal unit of measure"。写成纯乘除加减:
+%       \dimexpr \snpitch*\pi - \snpitch*\snnum/2 + \snpitch/2 \relax
+%   (第 π 个引脚的偏移, n 个引脚, 间距 \snpitch)。另外 `0.5\snpitch` 这种
+%   "数字直接贴寄存器"也不成立, 要么 `/2`, 要么 `*5/10`。
+%
+% ⚠ 参数序必须与 \MCU 一致(名/x/y/宽/高/说明/...): 初版把"高"省掉却忘了改
+%   下面那两行 `#5/2`, 于是**说明文字被当成尺寸**参与 pgfmath, 报
+%   `Unknown function 'STM32F103C8T6'` —— 参数个数变了, 位置引用要一起查。
+\newcommand\MCUauto[8]{%
+  \coordinate (#1c) at (#2,#3);%
+  \coordinate (#1se) at ($(#1c)+(#4/2,-#5/2)$);%
+  \coordinate (#1nw) at ($(#1c)+(-#4/2,#5/2)$);%
+  \draw[wire] (#1nw) rectangle (#1se);%
+  \node[annb, font=\small\bfseries] at ($(#1c)+(0,#5/2+0.40cm)$) {#1};%
+  \node[ann, font=\footnotesize] at ($(#1c)+(0,-#5/2-0.34cm)$) {#6};%
+  % 先把间距与引脚数定下来
+  \snpitch=#7\relax
+  \snnum=0
+  % ⚠ 必须 `\global\advance`: \foreach 的循环体是**有分组的**, 普通
+  %   `\advance` 只在组内生效, 循环一结束计数就回退成 0 —— 实测症状是
+  %   "引脚间距对、但整体偏了一个间距"(因为 n 当 0 用, 居中项少了一半)。
+  %   这与 \Chain 里"循环变量局部化、要 \xdef 存末项"是同一类坑, 第二次踩。
+  \foreach \pn in {#8}{\global\advance\snnum by 1}%
+  \foreach \pn [count=\pi from 0] in {#8}{%
+    % 偏移 = 半范围 − π×间距, 使**列表第一个引脚落在最上面**(自上而下,
+    % 与数据手册的引脚图画法一致)。
+    % ⚠ 初版写成 `间距*π − 半范围`, 于是列表序是**自下而上** —— 图上看不出
+    %   错(间距一样匀), 但 PA0/PA1 的上下关系与惯例相反, 读数手册的人会看错。
+    %   这种"顺序反了"没有任何门禁能查, 只能靠语义定对。
+    \snoff=\dimexpr \snpitch*\snnum/2 - \snpitch/2 - \snpitch*\pi \relax
+    \coordinate (#1\pn) at ($(#1c)+(#4/2+0.85cm,\snoff)$);%
+    \Wire{$(#1c)+(#4/2,\snoff)$}{#1\pn}%
+    \node[ann, font=\footnotesize, anchor=south east]
+      at ($(#1c)+(#4/2-0.10cm,\the\snoff+0.28pt)$) {\pn};%
+    \Term{#1.\pn}{#1\pn};%
+  }%
+  \SNname{#1nw / #1se / #1c / 每个引脚: #1<引脚名> (自动等距 #7)}%
+}
+\makeatother
+
+% ================================================================
+%  自动布局: \Chain (串联支路) 与 \Bus (母线挂支路)
+% ================================================================
+% 为什么需要: 光有"端子坐标不手填"还不够。器件一多, **摆位**本身就成了主要
+% 工作量 —— 本轮画那张图, 返工几乎全部来自"器件摆太挤", 没有一处是"端子接
+% 不上"。\Chain 与 \Bus 正是为解决这个而存在。
+%
+% 做法: 用 `to[...]` 把元件**串在一条路径**上, 于是
+%   * 元件间距由步进向量决定, 连"净间距 + 半宽"都不用算;
+%   * 路径上所有元件天然连通, 不可能出现"差几像素没接上"。
+
+% ---- 名称拼接工具 ----------------------------------------------
+% 为什么专门做这个: circuitikz 的 to[] 元件生成的是**独立节点**
+% ⟨名⟩start / ⟨名⟩end(**直接拼接, 没有连字符**)。想引用它们就得把
+% "基名 + 后缀"拼成一个节点名。而 TeX 里 `\cmd start` 会在 `\cmd` 展开后
+% **留下那个空格**, 拼出 `L1R start` —— 节点查找失败。
+% 正确做法是把后缀当**独立参数**传进来再连写: `#1#2`(无空格)。
+\def\SNfull{}
+\newcommand\SNanchor[2]{\def\SNfull{#1#2}}
+%─ 登记一个 to[] 元件的两端端子 + 本体盒 ────────────────────────
+% #1 = 节点基名(ASCII), #2 = 侧车里用的元件名(可与基名不同)
+\newcommand\SNregTwo[2]{%
+  \SNanchor{#1}{start}\Term{#2.a}{\SNfull}%
+  \SNanchor{#1}{end}\Term{#2.b}{\SNfull}%
+  \Body{#2}{#1}%
+  \SNanchor{#1}{start}\coordinate (#2a) at (\SNfull);%
+  \SNanchor{#1}{end}\coordinate (#2b) at (\SNfull);%
+  \LogLabel{#1}%
+  \SNname{#2 / #2a / #2b}%
+}
+
+% ---- \Chain{前缀}{起点}{步进向量}{元件表}: 串联支路 ------------
+% 元件表 = {键/符号/值标注, ...}
+%   键        侧车里的元件名后缀(ASCII)
+%   符号      circuitikz 的 to[...] 键(R / C / leD / D / L / switch …)
+%   值标注    该元件的**值**(如 1K / 100nF); **留空则不标**。
+%
+% ⚠ 为什么值是单独一个字段, 且内部写成 `l={\cval}`:
+%   实测 pgfkeys 在**扫描阶段**就按字面的 `=` 切分键名, 任何"把整个
+%   `l=1K` 通过宏传进去"的写法都会失败, 报
+%   `I do not know the key '/tikz/l=1K'`。可用的只有两种:
+%     `l=值`   —— 值字面出现(能行, 但值就不能来自循环变量)
+%     `l={宏}` —— 等号字面、值走宏(**本宏采用**), 空值也安全
+%   还试过把条件判断 `\ifx...\else l=...i` 内联进选项列表 —— 会破坏
+%   pgfkeys 的花括号配平(`\else` 泄漏到外面), 报一堆 "Extra \else"。
+%   所以"空值不标注"由 \LogLabel 侧过滤零面积盒来兜(见那边的注释)。
+%   需要更复杂选项的元件, 直接用 \cPart 手写, 不要走 \Chain。
+%
+% 用法:
+%   \Chain{L1}{\PinDrive}{1.8cm,0}{%
+%     R/R/1K,
+%     LED/leD/,
+%   }
+%   → 侧车里得到 L1R.a/.b 与 L1LED.a/.b, 且两者被串在同一条路径上
+%
+% 产出坐标名:
+%   ⟨前缀⟩start        路径起点
+%   ⟨前缀⟩end          路径末端(最后一个元件的 b 端)
+%   ⟨前缀⟩⟨键⟩a / b    各元件两端
+%   ⟨前缀⟩⟨键⟩         该元件的**节点名**(可取 .north/.south 摆标注)
+%
+% 拉大间距: 步进向量给大些(如 `2.2cm,0`); 想让某元件单独占更宽位置, 拆成
+% 两次 \Chain, 中间用 \WireH/\WireV 接起来。
+%
+% **竖放**同样用这个宏, 只是把步进向量改成 `0,-1.6cm` —— 于是"电阻→二极管"
+% 从上往下串。示例图 §⑤ 那种反并联结构就靠它竖着摆两个器件。
+%
+% ⚠ 起点参数要用**命名坐标**或纯坐标, **不要**把 `(24,0 |- CT1no)` 这种
+%   "竖线 ∩ 行"的表达式直接写进参数 —— 宏参数会被先行扫描/展开, pgf 拿到的
+%   已不是原样的坐标表达式, 报
+%   "Giving up on this path. Did you forget a semicolon?"。
+%   先 `\coordinate (S) at (24,0 |- CT1no);` 再把 `S` 传进来即可。
+\newcommand\Chain[4]{%
+  \coordinate (#1start) at (#2);%
+  \draw[wire] (#1start)
+    \foreach \ck/\csym/\cval in {#4}{%
+      to[\csym, name=#1\ck, l={\cval}] ++(#3)%
+    };%
+  % ⚠ 记账说明: circuitikz 把一串元件画在**一条路径**上, 相邻元件是"端子对
+  %   端子"直接对接的, 侧车里没有对应的 W 记录。这**不是缺口** —— 检查器的
+  %   连通规则本来就把"两元件端子重合"当成连通(见 check_tex_net 检查 6),
+  %   所以链内各节都能正确识别。
+  %   唯一要注意的是**起点 #2**: 若它不是某个元件的端子(比如直接给了 MCU
+  %   引脚坐标), 那第一个元件的 a 端会被报 [悬空], 因为"端子对接"只认
+  %   端子与端子。此时调用方补一条 \WireH{起点}{#1start} 即可 —— 那条线
+  %   会把 a 端连到导线上。
+  %
+  % ⚠ 末键必须**在循环内**用 \xdef 存出来: \foreach 的循环变量是局部化的,
+  %   循环一结束 \ck 就没了(实测报 "No shape named `L1end' is known" ——
+  %   因为拼出的是 `L1 end` 这种残名)。
+  \def\SNlastkey{}%
+  \foreach \ck/\csym/\cval in {#4}{%
+    \SNregTwo{#1\ck}{#1\ck}%
+    \xdef\SNlastkey{\ck}%
+  }%
+  \SNanchor{#1\SNlastkey}{end}\coordinate (#1end) at (\SNfull);%
+  \SNname{#1start / #1end}%
+}
+
+% ---- \Bus{前缀}{母线x}{上y}{下y}{侧}{支路表}: 母线 + 挂支路 -----
+% 适用场景: **一个节点接 3~4 个元件** —— 串联主干用 \Chain, 这种分支节点
+% 用 \Bus。典型:
+%     集电极 ── 线圈 / 续流管 / Q1.c
+%     +5V 母线 ── 线圈 / 续流管 / 触点
+% 做法: 画一根**竖直母线**, 每个支路从它上面按位置比引出去, 元件**横放**
+% 挂在母线一侧。
+%
+% ⚠ **不适用**: 反并联结构(线圈与续流管反并联)。那种要求两个器件**竖放**
+%   才能让"上端同接 A、下端同接 B"一目了然; \Bus 把元件横排, 反并联关系
+%   在图上就看不出。反并联请分别用 \Chain 竖放 + 导线接成并联(示例图 §⑤)。
+%
+% 支路表 = {键/符号/位置比/值标注, ...}
+%   位置比 0..1 —— 接在母线自上而下哪个高度。
+%   值标注留空则不标(写 `{}` 或整段省略)。
+% 侧 = left | right —— 支路挂在母线哪一侧。
+%
+% ⚠ 元件一律**离母线让开一段** —— 绝不能让元件骑在母线上: 母线是一条连续
+%   竖线, 会纵穿元件本体 = [穿体](该元件被旁路)。所以元件排在母线侧面
+%   2.2cm 处, 用一条水平引线接回母线接入点, 并打结点。
+%
+% 用法:
+%   \Bus{B1}{12.4}{-5.2}{-9.9}{left}{%
+%     D2/D/0.30/1N4148,
+%     K1/L/0.62/5V,
+%   }
+%
+% 产出: ⟨前缀⟩top/bot(母线上/下端), ⟨前缀⟩⟨键⟩a/b(各支路两端),
+%       ⟨前缀⟩⟨键⟩tap(该支路在母线上的接入点), ⟨前缀⟩⟨键⟩(节点名)
+\newcommand\Bus[6]{%
+  \coordinate (#1top) at (#2,#3);%
+  \coordinate (#1bot) at (#2,#4);%
+  \WireV{#1top}{#1bot}%
+  % 侧向判断: TeX 没有字符串相等, 惯用做法是"定义探针宏再 \ifx 比"。
+  % 两个分支各自成段, 比"先算 1 再乘符号"可读。
+  %
+  % ⚠ 坐标一律用 calc 的 `($(A)+(dx,dy)$)`, **不要**写 `({#2+2.2cm}, ...)`:
+  %   `#2` 是纯数字(如 6, 单位是 cm 但文本里没写), 与 `2.2cm` 相加时 TeX
+  %   会先把它当成**节点名**去找(实测报 "No shape named `0' is known"),
+  %   或把结果算成 68pt 这种离谱值。calc 里节点名与长度分开写就不会。
+  %
+  % ⚠ 右侧分支里元件是**向左挂**的: 元件横放后 a 端在左、b 端在右, 而母线
+  %   在元件左侧, 所以要从 **a 端**接回母线; 左侧分支反之, 从 b 端接回。
+  %   这两个接错就是一条线横穿元件两端(两端同网 = [旁路])。
+  \def\SNwantR{r}%
+  \ifx#5\SNwantR
+    \def\SNdoBranches{%
+      \foreach \bk/\bsym/\bratio/\bval in {#6}{%
+        \coordinate (#1\bk tap) at (#2, {#3+(#4-#3)*\bratio});%
+        \coordinate (#1\bk c) at ($(#1\bk tap)+(2.2cm,0)$);%
+        \draw[wire] (#1\bk c) to[\bsym, name=#1\bk, l={\bval}] ++(1.5cm,0);%
+        \SNregTwo{#1\bk}{#1\bk}%
+        \WireH{#1\bk a}{#1\bk tap}%
+        \Junction{#1\bk tap}%
+      }%
+    }%
+  \else
+    \def\SNdoBranches{%
+      \foreach \bk/\bsym/\bratio/\bval in {#6}{%
+        \coordinate (#1\bk tap) at (#2, {#3+(#4-#3)*\bratio});%
+        \coordinate (#1\bk c) at ($(#1\bk tap)+(-2.2cm,0)$);%
+        \draw[wire] (#1\bk c) to[\bsym, name=#1\bk, l={\bval}] ++(1.5cm,0);%
+        \SNregTwo{#1\bk}{#1\bk}%
+        \WireH{#1\bk b}{#1\bk tap}%
+        \Junction{#1\bk tap}%
+      }%
+    }%
+  \fi
+  \SNdoBranches
+  \SNname{#1top / #1bot / 每条支路: #1<键> / #1<键>a / #1<键>b / #1<键>tap}%
+}
+
+% ---- 关于"自动避让标注"为什么这里不做 -------------------------
+% 靠**整图几何**为每个标注找不压线不压字的位置, 在 TeX 里**做不了**:
+% 那需要在图末拿到全部盒与线、然后**重新排版**试探位置
+% (TikZ 的盒只有在排版后才知道, 挪一个标注可能牵动整图), 代价远超收益。
+% 而且本方案已经有更好的替代:
+%   * 排版门 (check_tex_layout.py) 直接报出"把后者上移 ≥21.9pt", 精确到
+%     可照做 —— 实测 4 轮内收敛;
+%   * 标注盒是**真实测量值**, 不是估算, 所以报出来的偏移量是准的。
+% 结论: 交付流程是"写 → 跑排版门 → 按它给的数值挪", 而不是"让 TeX 自己找"。
+
+\AtEndDocument{%
+  \makeatletter
+  \SNwrite{# wires=\the\snwires\space terminals=\the\snterms\space bodies=\the\snbodies}%
+  \immediate\closeout\snet
+  \typeout{[stm32tikz] sidecar \jobname.net written: \the\snwires\space wires, \the\snterms\space terminals, \the\snbodies\space bodies}%
+  \makeatother
+}
