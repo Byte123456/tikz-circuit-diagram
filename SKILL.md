@@ -197,7 +197,7 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 
 **"查了没问题"和"压根没看"在输出上长得一模一样。**
 
-改动检查器或 style 之后，**一定要跑 `selftest_tex.py`**（57 用例，含端到端
+改动检查器或 style 之后，**一定要跑 `selftest_tex.py`**（58 用例，含端到端
 断言"TeX 侧记账条数正确"）。它抓的是"检查器本身被改坏"，这是最危险的一类
 回归。新增检查时，**先写一个能复现的注错用例并确认它 FAIL**，再去修。
 
@@ -221,6 +221,6 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 - [ ] `check_tex_net.py` 返回 **0**（电气九类全过）—— 返回 **2** 是"没检查成"，
       别当通过
 - [ ] `--show-nets` 人工核对过**方向性器件**两端落在哪个网
-- [ ] `selftest_tex.py` **57/57，且跳过 0 个**（如果改过检查器或 style）
+- [ ] `selftest_tex.py` **58/58，且跳过 0 个**（如果改过检查器或 style）
 - [ ] 渲染出 PNG 用眼睛看一遍**布局**（中文显示成方块是渲染器缺 CJK 字体，
       SVG/PDF 本身正常，不要去"修"字体）
