@@ -59,7 +59,7 @@ python <skill>/scripts/gen_pins.py /path/to/fw \
 
 ```latex
 \documentclass[border=12pt]{standalone}
-\usepackage{ctex}                 % 中文必需(缺了会报误导性的爆栈错误, 见下)
+\usepackage{ctex}                 % 中文必需(缺了 build 会报「CJK 字形缺失」, 见常见坑)
 \usepackage{stm32tikz}
 \begin{document}
 \begin{tikzpicture}[font=\small]
@@ -102,18 +102,9 @@ python <skill>/scripts/gen_pins.py /path/to/fw \
 （实测：`\cPart` 的本体尺寸是常数、不随跨度缩放；但跨度小于本体宽时**本体盒会
 越出端点**，所以间距要按**本体宽**算，不是按跨度。）
 
-**② 写 `\Expect` 之前先跑 `--show-nets`。**
+**② 写 `\Expect` 之前先看网表（build 每次都自动打印）。**
 连通性分析里**元件本体是网络边界**：隔着电阻本体两点就是两张网。
-凭电路直觉写断言会被报 `[接错]`，而门禁报得对。先看实际的网再写，一次就过。
-
-#### 两条最容易踩的语法规矩
-
-1. **坐标参数不写外层括号**：`\WireH{A}{B}`，不是 `\WireH{(A)}{(B)}`。
-   宏内部自己补括号；带括号进去会变成 `((A))`，报 `No shape named '(A' is known`。
-   （唯一例外：`\Anno` 的位置参数**要**带括号，它直接转交给 `\node ... at`。）
-2. **calc 表达式里节点名必须带括号**：`$(Q1e)+(0,-0.8cm)$`，
-   **不是** `$Q1e+(0,-0.8cm)$`。后者 pgf 把 `Q1e` 当数学函数名，
-   报 `File ended while scanning use of \tikz@cc@parse@factor`。
+凭电路直觉写断言会被报 `[接错]`，而门禁报得对。对照网表写，一次就过。
 
 ### 4. 一键闭环（必须跑，不可跳过）
 
@@ -122,7 +113,7 @@ python <skill>/scripts/build.py circuit --svg
 ```
 
 它依次做五件事：`xelatex` → `place.py` 自动摆标注 → 再 `xelatex` →
-两道门 → `pdftocairo` 出 SVG。工作目录就是你运行它的目录，产物留在那儿。
+两道门 + 网表摘要 → `pdftocairo` 出 SVG。工作目录就是你运行它的目录，产物留在那儿。
 
 **两道门都返回 0 才算交付。**
 
@@ -160,8 +151,8 @@ python <skill>/scripts/selftest_tex.py                          # 回归
 ### 6. 人眼核对极性 —— 没有工具能替代
 
 **极性/方向任何连通性检查都查不出。** 两根线都接在正确的端子上时，连通性
-完美，两道门全报 0。必须用 `--show-nets` 打印网表，逐条读方向性器件两端
-落在哪个网：
+完美，两道门全报 0。build 每次都会打印网表摘要；网多时手动跑全量，
+逐条读方向性器件两端落在哪个网：
 
 ```bash
 python <skill>/scripts/check_tex_net.py --show-nets circuit.net
@@ -181,8 +172,6 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 
 1. **竖直元件的接线只从最近的端子起笔。** 电阻本体在两端点连线的中段，
    任何"从本体上方一路画到下方"的竖线都是**穿体**（= 把该元件旁路）。
-2. **母线不能让元件骑在上面。** `\Bus` 内部已把元件让开 2.2cm 并打结点，
-   手写时照做。
 
 ---
 
@@ -190,11 +179,11 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 
 ### 中文必须 `\usepackage{ctex}`
 
-**不只是排版问题**：缺了它，中文在 `lmroman8-regular` 里没字形，TeX 会在
-`\@setfontsize` 里**递归到爆栈**，报出来的是
-`TeX capacity exceeded [input stack size=10000]` —— 完全不指向真因。
-写 CJK 探针文档也一样。（`器件名必须 ASCII`、`零长导线` 两个相关坑见
-quickref 的「器件」与「画线」两节。）
+骨架里已带。缺了它有两种表现，**build.py 都会自动识别并报错**，无需预读：
+旧 TeX 报 `TeX capacity exceeded`（完全不指向真因）；新 MiKTeX 更阴险——
+**编译成功、门禁全绿、但 PDF/SVG 里中文全部没渲染**（中文标注的排版盒成了
+空盒，量了等于没量）。看到 build 报「CJK 字形缺失」就补 ctex，别去查图。
+（`器件名必须 ASCII`、`零长导线` 两个相关坑见 quickref 的「器件」与「画线」两节。）
 
 ### 值标签必须跟 `\LogLabel`
 

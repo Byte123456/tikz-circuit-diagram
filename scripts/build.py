@@ -69,6 +69,89 @@ def first_errors(out, n=8):
     return [ln for ln in out.splitlines() if any(k in ln for k in keys)][:n]
 
 
+def tex_hints(out):
+    """从编译输出里识别"报错误导性很强"的已知坑, 给出指向真因的提示。
+
+    这些提示存在的意义: 让 agent **不用预读文档**就能排错。此前"缺 ctex
+    报爆栈"必须写进 SKILL.md 常见坑让人提前记住 —— 现在报错自己会说话。
+    """
+    hints = []
+    if "capacity exceeded" in out and "input stack" in out:
+        # 缺 ctex 的**旧**形态: 中文没有字形, TeX 递归到爆栈, 报出来的
+        # 栈溢出完全不指向真因。(新版 MiKTeX 已改走"静默丢字形"路线,
+        # 见 cjk_missing —— 但旧 TeX Live 上仍是这个表现, 提示保留。)
+        hints.append("→ 「TeX capacity exceeded / input stack」多半不是图的"
+                     "问题: 缺 \\usepackage{ctex}。中文没有字形时 TeX 会"
+                     "递归爆栈, 检查 preamble 是否已加载 ctex。")
+    return hints
+
+
+_CJK_MISS = re.compile(
+    r"Missing character: There is no ([\u3400-\u9fff\uf900-\ufaff]) in font")
+
+
+def cjk_missing(log_path):
+    """检查 .log 里有没有「CJK 字形缺失」(缺 \\usepackage{ctex} 的标志)。
+
+    这个形态比爆栈**更阴险**(实测, MiKTeX 25.x): 编译成功、双门全绿,
+    但 PDF/SVG 里中文**全部没渲染** —— 中文标注的排版盒量出来是空的,
+    门禁拿这些空盒照样判"无重叠"。这是渲染层的"压根没看": 图看着是好的,
+    交出去才发现满纸空洞。好在 .log 每丢一个字形就记一行
+    `Missing character: There is no ⟨CJK⟩ in font`, 一查便知。
+
+    只匹配 CJK 码位: 本工具的中文只经 ctex 管理, ctex 正常时不会出现
+    这行; `; in font nullfont` 之类的英文噪音(未定义宏的副产物)不误伤。
+    """
+    if not os.path.exists(log_path):
+        return False
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        return bool(_CJK_MISS.search(f.read()))
+
+
+def cjk_fail_if_missing(stem):
+    """编译"成功"后核 .log; 发现中文没渲染就按**失败**处理。
+
+    返回 True 表示已报错, 调用方应立刻 return 2。整个交付物在渲染层是坏的
+    (中文全空), 放它过门禁等于交一张白卷。
+    """
+    if not cjk_missing(stem + ".log"):
+        return False
+    print("  ⚠⚠ 编译「成功」, 但 .log 里有「CJK 字形缺失」—— 中文**没有渲染**!",
+          file=sys.stderr)
+    print("     → 缺 \\usepackage{ctex}。此时双门全绿也是假的: 中文标注的"
+          "排版盒是空的, 量了等于没量。", file=sys.stderr)
+    print("       修法: preamble 加 \\usepackage{ctex}(放在 stm32tikz 之前)。",
+          file=sys.stderr)
+    return True
+
+
+def print_net_summary(net):
+    """把网表**自动**打出来(紧凑版)。
+
+    为什么: "写 \\Expect 前先跑 --show-nets" 曾是一条必须预读、靠自觉遵守的
+    行为规则 —— 而"查了没问题"和"压根没看"在输出上一模一样, 跳过它毫无
+    声息。把网表直接摆在每次 build 的输出里, 这条规则就不再需要被记住:
+    信息每次都在眼前。网太多时只报数量, 保持输出紧凑。
+    """
+    try:
+        from sidecar import parse_sidecar, build_nets   # noqa: E402
+        sc = parse_sidecar(net)
+        _, _, nets, *_ = build_nets(sc)
+    except Exception:                    # noqa: BLE001
+        return                           # 门禁会报告侧车问题, 这里不添乱
+    named = sorted((sorted(set(ms)) for ms in nets.values() if len(ms) >= 2),
+                   key=lambda ms: (-len(ms), ms))
+    if not named:
+        return
+    if len(named) <= 10:
+        print("  网表(写 \\Expect 前对照; 元件本体是网络边界):")
+        for i, ms in enumerate(named, 1):
+            print(f"    网{i}: {', '.join(ms)}")
+    else:
+        print(f"  网表: {len(named)} 张多成员网(不逐条列出; "
+              f"要看全跑 check_tex_net.py --show-nets {net})")
+
+
 def gate(script, net, extra=()):
     here = os.path.dirname(os.path.abspath(__file__))
     r = run([sys.executable, os.path.join(here, script), *extra, net])
@@ -114,13 +197,21 @@ def main():
         print("  编译失败。前几条:")
         for ln in first_errors(out, 10):
             print("    " + ln)
+        for h in tex_hints(out):
+            print("  " + h)
         log = stem + ".log"
         if os.path.exists(log):
+            logtxt = ""
             with open(log, encoding="utf-8", errors="replace") as f:
-                for ln in first_errors(f.read(), 14):
-                    print("    " + ln)
+                logtxt = f.read()
+            for ln in first_errors(logtxt, 14):
+                print("    " + ln)
+            for h in tex_hints(logtxt):
+                print("  " + h)
         return 2
     print("  ok")
+    if cjk_fail_if_missing(stem):
+        return 2
 
     # ---- 自动摆位 + 第 2 遍 ----
     if not args.no_place:
@@ -151,8 +242,12 @@ def main():
             print("  第二遍编译失败:")
             for ln in first_errors(out2):
                 print("    " + ln)
+            for h in tex_hints(out2):
+                print("  " + h)
             return 2
         print("  ok")
+        if cjk_fail_if_missing(stem):
+            return 2
     else:
         print("[2/5] 自动摆位: 关掉了 (--no-place)")
         print("[3/5] 跳过")
@@ -182,6 +277,8 @@ def main():
         for o, rc in ((o_l, rc_l), (o_n, rc_n)):
             if rc != 0:
                 print(o)
+    # 网表摘要(自动, 紧凑): 让"写 \Expect 前先看网"不再是一条需要预读的规则
+    print_net_summary(net)
 
     # ---- SVG ----
     svg_fail = False

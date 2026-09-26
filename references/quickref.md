@@ -14,14 +14,20 @@
 | `\WireV{a}{b}` | 竖直走线，**声明两端同 x**。斜了会被报 `[非正交]` |
 | `\Junction{点}` | 结点。**交叉的两条线默认不连通**，只有画了结点才算连上 |
 
-**接线一律用 `\WireH`/`\WireV`，别用裸 `\Wire`。** 斜线在连通性分析里没有
-定义（"两条斜线交叉算不算连"无从判定），检查器只能整个丢掉——丢掉就是**漏检**：
-一条斜着画出、两端又没真接上的线，会被当成不存在，图看着连了、检查器说没问题。
+**接线一律用 `\WireH`/`\WireV`，别用裸 `\Wire`。** 斜线会被连通性分析**整个
+丢弃**（斜线交叉算不算连无从判定）—— 一条斜着画出、两端没真接上的线会被当成
+不存在，图看着连了、检查器说没问题。
 
 `a`/`b` 是**点表达式**，支持：节点名（`R1end`）、`节点.锚点`（`Q1.C`）、
 命名坐标（`ledA`）、裸坐标（`1cm,2cm`）、calc 表达式（`$(Q1e)+(0,-1cm)$`）。
 
 ⚠ **不写外层括号**：`\WireH{A}{B}` 而不是 `\WireH{(A)}{(B)}`。
+   宏内部自己补括号；带括号会变成 `((A))`，报 `No shape named '(A'`。
+   （唯一例外：`\Anno` 的位置参数**要**带括号，它直接转交给 `\node ... at`。）
+
+⚠ **calc 表达式里节点名必须带括号**：`$(Q1e)+(0,-0.8cm)$`，不是
+   `$Q1e+(0,-0.8cm)$` —— 后者 pgf 把 `Q1e` 当数学函数名，报
+   `File ended while scanning use of \tikz@cc@parse@factor`。
 
 ⚠ 两端重合会记成 `M|零长导线`（记账警告）。不影响连通性，但说明你
 **以为两个点是分开的**——通常取错了锚点。
@@ -123,9 +129,8 @@ python <skill>/scripts/place.py circuit.net --pin ct1name=0,-30   # 单位 pt
 `\AnnoPack` 给一个**列顶坐标**，`place.py` 读侧车里每块的**真实高度**，
 按 `高度 + 间隙` 依次往下排。
 
-**为什么必须用它**：说明块很高（实测单块 88～229pt），手猜坐标一旦撞上就是
-**大片重叠**。实测两块互压 235pt、其中一块还坐在 GND 符号上，修法是手猜新坐标
-——纯 guess→build→check，占掉了 3 次 build 里的 2 次。
+**为什么必须用它**：说明块很高（单块可达 229pt），手猜坐标一旦撞上就是大片
+重叠，而且"差一点点"时排版门也未必报。
 
 ⚠ 样式里**不要写 `anchor=`**（堆叠按 `north west` 对齐列的左边界，写了会错位）。
 ⚠ 同一列的多块**共用同一个列顶坐标** —— place.py 就是按"锚点相同"分组的。
@@ -241,31 +246,18 @@ python <skill>/scripts/place.py circuit.net --pin ct1name=0,-30   # 单位 pt
 | `\NetTag{号}{点}` | 网络标签，同号相连 |
 | `\Junction{点}` | 结点（交叉连通标记） |
 
-### ⚠ 写 `\Expect` 之前，先跑 `--show-nets` 看实际的网
+### ⚠ 写 `\Expect` 之前，先看网表
+
+`build.py` 每次都会自动打印紧凑网表；网多时手动跑全量：
 
 ```bash
 python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 ```
 
-**别凭电路直觉猜网结构。** 连通性分析里**元件本体是网络边界**，不是导线：
-电流过不过得去与"是不是同一张网"是两回事。
-
-一个实际踩过的例子（NPN 开漏驱动 + 外部上拉）：
-
-```
-引脚侧那张网:  MCU.PA0, RBR.a, RPR.a      ← 上拉电阻接在引脚端
-基极那张网:    QR.b, RBR.b                 ← 基极限流电阻另一端
-```
-
-我按"上拉应该落在基极"的直觉写了 `\Expect{RP.a}{Q.b}`，被报 3 条 `[接错]`。
-**门禁报得对** —— 这两点之间隔着 `RBR` 的本体，本来就是两张网，没有导线连接。
-跑一次 `--show-nets` 一眼就能看清，但我是在写完断言、跑完 build 之后才跑的，
-白费一次 build。
-
-**正确的写法是先看网、再写断言**，而且这个顺序还能帮你发现真实的接错：
-上拉必须落在**引脚端**（才能把高阻态拉高）；落在基极侧虽然也能点亮，
-却失去了开漏输出的意义 —— 那正是"会接错但门禁查不出"的地方
-（两根线都接在正确端子上，连通性完美）。
+**别凭电路直觉猜网结构。** 连通性分析里**元件本体是网络边界**：隔着电阻本体
+两点就是两张网。实测在开漏驱动图里按"上拉应落在基极"的直觉写 `\Expect` 被
+报 3 条 `[接错]`——门禁报得对，上拉与基极之间隔着一个限流电阻的本体。
+**先看网、再写断言，一次就过**；这个顺序还能帮你发现真实的接错。
 
 ⚠ `\Expect` **抓不住"同一元件两端接反"**——两极接的还是那两张网。
 那个只能靠人眼看图，见「极性」一节。
@@ -274,17 +266,14 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 
 ## 6. 调试与自检
 
+build/check/selftest 的命令见 SKILL.md「一键闭环」与「两道门各查什么」两节；
+这里只列 SKILL 没有的调试宏。
+
 | 宏 / 命令 | 用途 |
 |---|---|
 | `\ShowNames` | 打开后把自动生成的坐标名 `\typeout` 出来，并写进侧车 `N\|` 记录（可直接 grep 侧车）。**默认关闭** |
 | `\DumpCanvas` | 登记画布范围。**必须在 `\end{tikzpicture}` 之前调用一次** |
 | `\LogLabel{名}` | 把值标签排版盒收进侧车 |
-
-```bash
-python <skill>/scripts/build.py circuit --svg --report
-python <skill>/scripts/check_tex_net.py --show-nets circuit.net
-python <skill>/scripts/selftest_tex.py
-```
 
 ### 要测符号几何？先查表，再探针
 
@@ -296,19 +285,16 @@ python <skill>/scripts/gen_geometry.py           # 重新生成（改了符号�
 python <skill>/scripts/gen_geometry.py --check    # 校验表是否过期
 ```
 
-真要临时测新符号，用 `--probe` 而不是手写探针：
+真要临时测新符号，用 `--probe` 而不是手写探针（手写要自己设 TEXINPUTS、
+翻日志找 `\typeout`、手抄结果 —— 三个坑它都省了）：
 
 ```bash
 python <skill>/scripts/build.py x --probe probe.tex
 python <skill>/scripts/build.py x --probe -        # 从 stdin 读
 ```
 
-它会用**与正式 build 完全相同**的编译环境（同一个 TEXINPUTS、同一个 xelatex）
-编译探针，然后打印侧车摘要（本体盒/端子/文字盒/记账警告）。
-
-为什么值得用它：手写探针有三脚坑 —— 裸 `xelatex` **不加 TEXINPUTS**，第一脚就是
-`stm32tikz.sty not found`；`\typeout` 的输出在 stdout 里 grep 不到，要去 tail 日志；
-测出来的数还要手抄。`--probe` 把这三步都省了。
+它用**与正式 build 完全相同**的编译环境编译探针，打印侧车摘要
+（本体盒/端子/文字盒/记账警告）。探针里能编译通过的，正式图里一定能通过。
 
 ---
 

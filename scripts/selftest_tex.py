@@ -683,6 +683,35 @@ else:
 os.unlink(path)
 
 
+# --- (e) build.cjk_missing: 缺 ctex 的「静默丢字形」必须被识别 ---
+# 实测(新 MiKTeX): 缺 ctex 不再爆栈, 而是编译成功、双门全绿、中文全没渲染 ——
+# 文字盒量出来是空盒, 属于渲染层的"压根没看"。build.cjk_missing 查 .log 的
+# `Missing character: There is no ⟨CJK⟩ in font` 行; 这里用**合成日志**护住
+# 正则本身(不花编译时间), 三种情况都要对: CJK 丢字形 -> True; 英文字形缺失
+# (未定义宏的 nullfont 噪音)与正常英文 -> False。
+import build as B                          # noqa: E402
+
+fd, logp = tempfile.mkstemp(suffix=".log")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write("Missing character: There is no 中 in font [lmroman9-regular]!\n"
+            "Missing character: There is no 文 in font [lmroman9-regular]!\n")
+hit_cjk = B.cjk_missing(logp)
+os.unlink(logp)
+
+fd, logp = tempfile.mkstemp(suffix=".log")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write("Missing character: There is no ; in font nullfont!\n"
+            "Missing character: There is no x in font [lmroman9-regular]!\n")
+hit_ascii = B.cjk_missing(logp)
+os.unlink(logp)
+
+if hit_cjk and not hit_ascii:
+    PASS.append("ctex 缺失: CJK 字形缺失被识别, 英文噪音不误伤")
+else:
+    FAIL.append(f"ctex 缺失: cjk_missing 判定错误 (cjk={hit_cjk}, "
+                f"ascii={hit_ascii})")
+
+
 # =====================================================================
 #  17. 端到端: TeX 侧必须真的把记账写出来
 # =====================================================================
