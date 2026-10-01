@@ -110,6 +110,11 @@
 `\InputAnnoOffsets{auto_offsets.tex}`（文件不存在时全部退化成 0 偏移，
 编译照常）。
 
+**产物归档**：`build.py` 默认把 `.aux/.log/.net/.pdf/.svg` 和
+`auto_offsets.tex` 在构建结束时搬进当前目录的 `circuit/`，工程目录只留
+`.tex` 图源。换目录 `--outdir <目录>`；`--outdir .` 恢复旧行为（产物留原地）。
+单独跑 `place.py`/`check_tex_*.py` 时注意 `.net` 在 `circuit/` 里。
+
 **钉死某个标注**（位置有语义、不希望被自动挪走）：
 
 ```bash

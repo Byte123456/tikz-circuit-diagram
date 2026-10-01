@@ -7,9 +7,15 @@ r"""
 (开发本工具时的真事: 排版门一度看不到值标签, 报 0 问题; 不是"查了没问题",
 是"压根没看")。串成一条命令, 漏跑就成了执行不了。
 
-**工作目录 = 你运行它的目录**(不是脚本所在目录)。图与产物都留在你当前所在的
+**工作目录 = 你运行它的目录**(不是脚本所在目录)。.tex 图源就放在你当前所在的
 工程目录里; `stm32tikz.sty` 由脚本自动加进 TEXINPUTS, 不用拷贝、不用改
 preamble 里的 \\usepackage 路径。
+
+**产物归档目录 `circuit/`(默认开启)**: 编译产物(.aux/.log/.net/.pdf/.svg)和
+中间产物(auto_offsets.tex)在构建结束时统一搬进当前目录下的 `circuit/`,
+工程根目录只留 .tex 图源, 不再散落一堆中间文件。编译本身仍在工程目录进行
+(所以 `\\input{pins.tex}` 这类相对引用不受影响); `circuit/` 会自动加进
+TEXINPUTS, 下一轮的第一遍编译照常能读到上轮生成的偏移表。
 
 用法:
     python <skill>/scripts/build.py circuit            # 不给扩展名
@@ -17,6 +23,8 @@ preamble 里的 \\usepackage 路径。
     python <skill>/scripts/build.py circuit --svg      # 额外出 SVG
     python <skill>/scripts/build.py circuit --no-place # 关掉自动摆标注
     python <skill>/scripts/build.py circuit --report   # 逐个列出摆位结果
+    python <skill>/scripts/build.py circuit --outdir out          # 换归档目录
+    python <skill>/scripts/build.py circuit --outdir .            # 产物留在原地(旧行为)
 
 退出码: 0 = 全绿; 1 = 有一道门报问题; 2 = 编译失败或用法错误。
 """
@@ -158,6 +166,29 @@ def gate(script, net, extra=()):
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
+# 归档的产物集合: stem.扩展名 + 两个不跟 stem 走的固定文件。
+# (.out/.fls/.xdv 是 xelatex 可能留下的杂项; auto_offsets.tex 是 place.py 的
+#  中间产物, 名字固定; pins.tex 是**图源的一部分**, 绝不归档。)
+def tidy(stem, outdir):
+    """把产物搬进 outdir 并建目录。outdir 为 None 时是 --outdir . 的旧行为。"""
+    if outdir is None:
+        return
+    names = [stem + ext for ext in
+             (".aux", ".log", ".net", ".out", ".pdf", ".svg", ".xdv", ".fls")]
+    names.append("auto_offsets.tex")
+    moved = []
+    for n in names:
+        if os.path.exists(n):
+            os.makedirs(outdir, exist_ok=True)
+            dst = os.path.join(outdir, n)
+            if os.path.exists(dst):
+                os.remove(dst)               # 上一轮的旧产物, 直接覆盖
+            shutil.move(n, dst)
+            moved.append(n)
+    if moved:
+        print(f"产物已归档到 {outdir}/ ({len(moved)} 个文件)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="一键闭环: 编译 → 摆位 → 双门 → SVG")
     ap.add_argument("tex", help=".tex 文件名或主干(可省扩展名)")
@@ -167,6 +198,8 @@ def main():
     ap.add_argument("--probe", metavar="TEX",
                     help="编译一个一次性探针文档并打印侧车摘要(不跑门禁)。"
                          "TEX 给 `-` 表示从 stdin 读。省掉手写探针和 TEXINPUTS 的坑")
+    ap.add_argument("--outdir", default="circuit", metavar="DIR",
+                    help="产物归档目录(默认 circuit/, 设 . 关掉归档)")
     args = ap.parse_args()
 
     if args.probe is not None:
@@ -179,139 +212,158 @@ def main():
               f"  (工作目录: {os.getcwd()})", file=sys.stderr)
         return 2
 
+    # 产物归档目录。None = --outdir . (旧行为: 产物留在当前目录)。
+    # 编译**仍在当前目录**进行 —— \input{pins.tex} 等相对引用不受影响;
+    # 归档只是构建结束时把产物搬走。
+    outdir = None if args.outdir == "." else args.outdir
+    if outdir is not None:
+        outdir = os.path.normpath(outdir)
+
     sty_dir = _paths.find_sty()
     if not sty_dir:
         print(_paths.sty_hint(), file=sys.stderr)
         return 2
     env = _paths.texinputs_env()
+    if outdir is not None:
+        # 归档目录加进 TEXINPUTS: 下一轮第一遍编译要能读到上轮归档的
+        # auto_offsets.tex(\InputAnnoOffsets 对文件缺失本就宽容, 这里保证
+        # 文件存在时能被找到)。追加在**末尾**: cwd 优先, 归档目录兜底。
+        sep = ";" if os.name == "nt" else ":"
+        env["TEXINPUTS"] = (env.get("TEXINPUTS", "") + sep
+                            + os.path.abspath(outdir) + sep)
     print(f"样式: {os.path.join(sty_dir, 'stm32tikz.sty')}")
 
     net = stem + ".net"
 
-    # ---- 第 1 遍 ----
-    print(f"[1/5] xelatex {stem}.tex (第 1 遍)")
-    if os.path.exists(net):
-        os.remove(net)                       # 避免读到上一轮残留
-    ok, out = tex_compile(stem, env)
-    if not ok or not os.path.exists(net):
-        print("  编译失败。前几条:")
-        for ln in first_errors(out, 10):
-            print("    " + ln)
-        for h in tex_hints(out):
-            print("  " + h)
-        log = stem + ".log"
-        if os.path.exists(log):
-            logtxt = ""
-            with open(log, encoding="utf-8", errors="replace") as f:
-                logtxt = f.read()
-            for ln in first_errors(logtxt, 14):
+    # try/finally 保证**任何**退出路径(编译失败、CJK 缺字形、place 崩、门禁报
+    # 问题)都把产物归档 —— 只有成功路径归档的话, 失败一次就又散落一地。
+    try:
+        # ---- 第 1 遍 ----
+        print(f"[1/5] xelatex {stem}.tex (第 1 遍)")
+        if os.path.exists(net):
+            os.remove(net)                       # 避免读到上一轮残留
+        ok, out = tex_compile(stem, env)
+        if not ok or not os.path.exists(net):
+            print("  编译失败。前几条:")
+            for ln in first_errors(out, 10):
                 print("    " + ln)
-            for h in tex_hints(logtxt):
+            for h in tex_hints(out):
                 print("  " + h)
-        return 2
-    print("  ok")
-    if cjk_fail_if_missing(stem):
-        return 2
-
-    # ---- 自动摆位 + 第 2 遍 ----
-    if not args.no_place:
-        print("[2/5] place.py 解算标注偏移")
-        here = os.path.dirname(os.path.abspath(__file__))
-        cmd = [sys.executable, os.path.join(here, "place.py"), net]
-        if args.report:
-            cmd.append("--report")
-        r = run(cmd)
-        print("  " + (r.stdout or "").strip().replace("\n", "\n  "))
-        # place.py 的退出码: 0 = 全摆开, 1 = 有摆不开的(仍写偏移), >=2 = 工具错误。
-        # **>=2 必须让整条 build 失败** —— 此前一律继续, 于是 place.py 崩了
-        # (参数错、读不到实体)时 build 仍报"全绿", 而标注其实用的是上一次的
-        # 偏移表, 甚至根本没有偏移表。
-        if r.returncode >= 2:
-            print(f"  place.py 失败 (rc={r.returncode}) —— 标注偏移没算出, 停。",
-                  file=sys.stderr)
-            if r.stderr:
-                print("  " + r.stderr.strip().replace("\n", "\n  "),
-                      file=sys.stderr)
-            return 2
-        if r.returncode == 1:
-            print("  ⚠ 有标注**摆不开**(仍尽量给了偏移) —— 见上面的 [挤] 报告。",
-                  file=sys.stderr)
-        print("[3/5] xelatex (第 2 遍, 偏移生效)")
-        ok2, out2 = tex_compile(stem, env)
-        if not ok2:
-            print("  第二遍编译失败:")
-            for ln in first_errors(out2):
-                print("    " + ln)
-            for h in tex_hints(out2):
-                print("  " + h)
+            log = stem + ".log"
+            if os.path.exists(log):
+                logtxt = ""
+                with open(log, encoding="utf-8", errors="replace") as f:
+                    logtxt = f.read()
+                for ln in first_errors(logtxt, 14):
+                    print("    " + ln)
+                for h in tex_hints(logtxt):
+                    print("  " + h)
             return 2
         print("  ok")
         if cjk_fail_if_missing(stem):
             return 2
-    else:
-        print("[2/5] 自动摆位: 关掉了 (--no-place)")
-        print("[3/5] 跳过")
 
-    # ---- 双门 ----
-    print("[4/5] 两道门")
-    rc_l, o_l = gate("check_tex_layout.py", net)
-    rc_n, o_n = gate("check_tex_net.py", net)
-    for o in (o_l, o_n):
-        for ln in o.rstrip().splitlines():
-            if (ln.startswith("=====") or ln.startswith("==") or "  [" in ln
-                    or ln.startswith("错误:")):
-                print("  " + ln)
-    # rc=2 表示"输入有问题/侧车根本没检查" —— 与"检查了且有问题"不同, 但也
-    # 绝不能算过。此前只把非 0 与 0 二分, 空/缺失侧车被当成 rc=0 放过去了。
-    if rc_l == 0 and rc_n == 0:
-        print("  排版 0 / 电气 0 —— 全绿")
-    elif 2 in (rc_l, rc_n):
-        # rc=2 是"输入没检查成"(缺失/空侧车/用法错), 与 rc=1"查了有问题"
-        # 是两回事。混在一起会让人以为"电路有问题", 实际是**门根本没跑起来**。
-        print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— **有门没检查成**(见错误行)。")
-        for o, rc in ((o_l, rc_l), (o_n, rc_n)):
-            if rc != 0:
-                print(o)
-    else:
-        print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— 有问题:")
-        for o, rc in ((o_l, rc_l), (o_n, rc_n)):
-            if rc != 0:
-                print(o)
-    # 网表摘要(自动, 紧凑): 让"写 \Expect 前先看网"不再是一条需要预读的规则
-    print_net_summary(net)
-
-    # ---- SVG ----
-    svg_fail = False
-    if args.svg:
-        print("[5/5] pdftocairo -svg")
-        pdf = stem + ".pdf"
-        svg = stem + ".svg"
-        if not os.path.exists(pdf):
-            print("  失败: 没有 .pdf —— 上一遍编译没产出 PDF", file=sys.stderr)
-            svg_fail = True
-        elif not shutil.which("pdftocairo"):
-            print("  失败: 你**明确要了** --svg 但没装 pdftocairo。",
-                  file=sys.stderr)
-            print("        → 装 poppler(pdftocairo) 后重跑; "
-                  "或去掉 --svg 只要 .pdf。", file=sys.stderr)
-            svg_fail = True
+        # ---- 自动摆位 + 第 2 遍 ----
+        if not args.no_place:
+            print("[2/5] place.py 解算标注偏移")
+            here = os.path.dirname(os.path.abspath(__file__))
+            cmd = [sys.executable, os.path.join(here, "place.py"), net]
+            if args.report:
+                cmd.append("--report")
+            r = run(cmd)
+            print("  " + (r.stdout or "").strip().replace("\n", "\n  "))
+            # place.py 的退出码: 0 = 全摆开, 1 = 有摆不开的(仍写偏移), >=2 = 工具错误。
+            # **>=2 必须让整条 build 失败** —— 此前一律继续, 于是 place.py 崩了
+            # (参数错、读不到实体)时 build 仍报"全绿", 而标注其实用的是上一次的
+            # 偏移表, 甚至根本没有偏移表。
+            if r.returncode >= 2:
+                print(f"  place.py 失败 (rc={r.returncode}) —— 标注偏移没算出, 停。",
+                      file=sys.stderr)
+                if r.stderr:
+                    print("  " + r.stderr.strip().replace("\n", "\n  "),
+                          file=sys.stderr)
+                return 2
+            if r.returncode == 1:
+                print("  ⚠ 有标注**摆不开**(仍尽量给了偏移) —— 见上面的 [挤] 报告。",
+                      file=sys.stderr)
+            print("[3/5] xelatex (第 2 遍, 偏移生效)")
+            ok2, out2 = tex_compile(stem, env)
+            if not ok2:
+                print("  第二遍编译失败:")
+                for ln in first_errors(out2):
+                    print("    " + ln)
+                for h in tex_hints(out2):
+                    print("  " + h)
+                return 2
+            print("  ok")
+            if cjk_fail_if_missing(stem):
+                return 2
         else:
-            if os.path.exists(svg):
-                os.remove(svg)          # 先删, 好判断这次是否真的产出
-            r = run(["pdftocairo", "-svg", pdf, svg])
-            # 以**产物是否存在**判定, 不只看退出码。pdftocairo 正常失败时确实
-            # 会返回非 0(实测: 输入不存在 rc=1), 所以退出码可用; 但"以文件为准"
-            # 更稳 —— 它同时覆盖了"rc=0 却没写出文件"这种(理论上可能的)情形,
-            # 而只看退出码抓不到它。开销为零, 所以两个都查。
-            if r.returncode != 0 or not os.path.exists(svg):
-                print(f"  失败: pdftocairo rc={r.returncode}, "
-                      f"SVG {'没产出' if not os.path.exists(svg) else '已产出'}"
-                      f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
+            print("[2/5] 自动摆位: 关掉了 (--no-place)")
+            print("[3/5] 跳过")
+
+        # ---- 双门 ----
+        print("[4/5] 两道门")
+        rc_l, o_l = gate("check_tex_layout.py", net)
+        rc_n, o_n = gate("check_tex_net.py", net)
+        for o in (o_l, o_n):
+            for ln in o.rstrip().splitlines():
+                if (ln.startswith("=====") or ln.startswith("==") or "  [" in ln
+                        or ln.startswith("错误:")):
+                    print("  " + ln)
+        # rc=2 表示"输入有问题/侧车根本没检查" —— 与"检查了且有问题"不同, 但也
+        # 绝不能算过。此前只把非 0 与 0 二分, 空/缺失侧车被当成 rc=0 放过去了。
+        if rc_l == 0 and rc_n == 0:
+            print("  排版 0 / 电气 0 —— 全绿")
+        elif 2 in (rc_l, rc_n):
+            # rc=2 是"输入没检查成"(缺失/空侧车/用法错), 与 rc=1"查了有问题"
+            # 是两回事。混在一起会让人以为"电路有问题", 实际是**门根本没跑起来**。
+            print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— **有门没检查成**(见错误行)。")
+            for o, rc in ((o_l, rc_l), (o_n, rc_n)):
+                if rc != 0:
+                    print(o)
+        else:
+            print(f"  排版 rc={rc_l} / 电气 rc={rc_n} —— 有问题:")
+            for o, rc in ((o_l, rc_l), (o_n, rc_n)):
+                if rc != 0:
+                    print(o)
+        # 网表摘要(自动, 紧凑): 让"写 \Expect 前先看网"不再是一条需要预读的规则
+        print_net_summary(net)
+
+        # ---- SVG ----
+        svg_fail = False
+        if args.svg:
+            print("[5/5] pdftocairo -svg")
+            pdf = stem + ".pdf"
+            svg = stem + ".svg"
+            if not os.path.exists(pdf):
+                print("  失败: 没有 .pdf —— 上一遍编译没产出 PDF", file=sys.stderr)
+                svg_fail = True
+            elif not shutil.which("pdftocairo"):
+                print("  失败: 你**明确要了** --svg 但没装 pdftocairo。",
+                      file=sys.stderr)
+                print("        → 装 poppler(pdftocairo) 后重跑; "
+                      "或去掉 --svg 只要 .pdf。", file=sys.stderr)
                 svg_fail = True
             else:
-                print("  ok")
-    else:
-        print("[5/5] SVG: 未请求 (加 --svg)")
+                if os.path.exists(svg):
+                    os.remove(svg)          # 先删, 好判断这次是否真的产出
+                r = run(["pdftocairo", "-svg", pdf, svg])
+                # 以**产物是否存在**判定, 不只看退出码。pdftocairo 正常失败时确实
+                # 会返回非 0(实测: 输入不存在 rc=1), 所以退出码可用; 但"以文件为准"
+                # 更稳 —— 它同时覆盖了"rc=0 却没写出文件"这种(理论上可能的)情形,
+                # 而只看退出码抓不到它。开销为零, 所以两个都查。
+                if r.returncode != 0 or not os.path.exists(svg):
+                    print(f"  失败: pdftocairo rc={r.returncode}, "
+                          f"SVG {'没产出' if not os.path.exists(svg) else '已产出'}"
+                          f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
+                    svg_fail = True
+                else:
+                    print("  ok")
+        else:
+            print("[5/5] SVG: 未请求 (加 --svg)")
+    finally:
+        tidy(stem, outdir)
 
     if svg_fail:
         return 2                       # 明确请求的产物没出来 -> 整条失败

@@ -113,7 +113,11 @@ python <skill>/scripts/build.py circuit --svg
 ```
 
 它依次做五件事：`xelatex` → `place.py` 自动摆标注 → 再 `xelatex` →
-两道门 + 网表摘要 → `pdftocairo` 出 SVG。工作目录就是你运行它的目录，产物留在那儿。
+两道门 + 网表摘要 → `pdftocairo` 出 SVG。工作目录就是你运行它的目录；
+**产物在构建结束时统一归档进 `circuit/` 子目录**（`.aux/.log/.net/.pdf/.svg`
+和中间产物 `auto_offsets.tex`），工程目录只留 `.tex` 图源。换目录用
+`--outdir <目录>`；`--outdir .` 恢复"产物留在原地"的旧行为。编译本身仍在
+工程目录进行，`\input{pins.tex}` 这类相对引用不受影响。
 
 **两道门都返回 0 才算交付。**
 
