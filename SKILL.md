@@ -22,15 +22,23 @@ description: 用 TikZ/circuitikz 画 STM32 电路图（接线图、原理图、�
 一个直接后果值得先知道：**"畸形线段"、"悬空端子"、"飘端子"这三类缺陷在
 本方案里写不出来**。端点就是锚点，画线时必然精确落在端子上。
 
+> **最小读取集**（画一张图只需要这些，读完就停手）：
+> 本文件 + `references/quickref.md` + `assets/example_minimal.tex`。
+> 摆器件的间距按需查 `references/geometry.md`。其余文件**不必读**——
+> `stm32tikz.sty`（990 行宏包源码）、`sidecar-format.md`（改检查器才读）、
+> `example_photodiode_relay.tex`（带讲解的长示例，只有需要反并联/继电器/
+> 触点这类复杂模式时才翻）。
+
 ## 文件在哪
 
 | 路径 | 作用 |
 |---|---|
 | `references/quickref.md` | 宏签名、端子、坐标名、踩坑 —— **写图前读这一页** |
 | `references/geometry.md` | **符号几何表**（端子偏移/本体宽高/最小跨度/值标签高度），自动生成 |
+| `assets/example_minimal.tex` | **最小可编译样例**（约 100 行），照抄当起点 |
 | `references/sidecar-format.md` | 侧车格式、连通规则、TeX 侧陷阱 —— **改检查器或 style 时才读** |
 | `assets/stm32tikz.sty` | 核心宏包（由 `build.py` 自动加进 `TEXINPUTS`，不用拷贝） |
-| `assets/example_photodiode_relay.tex` | 完整示例，可照抄 |
+| `assets/example_photodiode_relay.tex` | 完整带讲解示例（反并联/继电器触点/\Chain/\Bus），需要时才读 |
 | `scripts/` | `build.py` 一键闭环（`--probe` 可测符号）；`gen_pins.py` 读工程引脚；`gen_geometry.py` 生成几何表；`place.py` 摆标注与说明块；两道门；`selftest_tex.py` 回归 |
 
 ---
@@ -192,8 +200,8 @@ python <skill>/scripts/check_tex_net.py --show-nets circuit.net
 ### 值标签必须跟 `\LogLabel`
 
 器件写了 `l=`/`v=` 之后必须 `\LogLabel{R1}`，否则值标签的排版盒不进侧车，
-**排版门就看不到它**（可能压线也不报）。器件名拼错时侧车会出现
-`M|找不到 label 节点` 警告——别忽略它。
+**排版门就看不到它**（可能压线也不报）。机制与 `M|找不到 label 节点` 警告
+见 quickref 的「值标签与 `\LogLabel`」一节。
 
 ---
 

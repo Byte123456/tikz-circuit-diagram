@@ -19,7 +19,13 @@ r"""
               不给 --tag 时默认全部标签 → \\Pin<标签名>
   --list      只列出工程里有哪些标签, 不写文件
 
-退出码: 0 = 已写出; 1 = 标签没找到; 2 = 用法/环境错误。
+⚠ **宏后缀只能含字母**。TeX 的控制序列遇非字母字符即结束, 所以
+  `\\def\\PinLED1{PA8}` 定义的其实是 `\\PinLED`(后面那个 `1` 是游离字符),
+  调用 `\\PinLED1` 会报 "Use of \\PinLED doesn't match its definition"。
+  本脚本会把后缀里的非字母字符去掉; 若净化后两个标签撞成同一个宏名, 会**报错
+  退出**并给出改法(而不是静默生成互相覆盖的 \\def)。
+
+退出码: 0 = 已写出; 1 = 标签没找到或宏名冲突; 2 = 用法/环境错误。
 """
 import argparse
 import os
@@ -29,11 +35,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from read_project import read_config                # noqa: E402
 
 
+def _tex_suffix(name):
+    """标签 → 合法的 TeX 控制序列后缀(只保留 ASCII 字母)。
+
+    TeX 的控制序列**只吃字母**, 遇到数字/下划线等非字母字符就结束。去掉它们
+    才能保证 `\\Pin<suffix>` 是单个合法控制序列。净化可能让两个标签撞名,
+    调用方负责查重。
+    """
+    return "".join(ch for ch in name if ch.isascii() and ch.isalpha())
+
+
+def _suggest_fix(clashes):
+    """给冲突的宏名生成一行可照抄的 --tag 命令。"""
+    parts = []
+    for s, tags in sorted(clashes.items()):
+        for j, t in enumerate(sorted(tags)):
+            parts.append(f"--tag {t}={s}{chr(65 + j)}")
+    return " ".join(parts)
+
+
+
 def main():
     ap = argparse.ArgumentParser(description="从 STM32 工程读引脚 → pins.tex")
     ap.add_argument("proj", help="STM32 工程目录(含 .ioc 或 Core/Inc/main.h)")
     ap.add_argument("--tag", action="append", default=[], metavar="标签=宏后缀",
-                    help="标签映射, 可多次给; 不给则全部标签 → \\Pin<标签名>")
+                    help="标签映射, 可多次给; 不给则全部标签 → \\Pin<标签名>。"
+                         "宏后缀只能含字母(非字母字符会被去掉)")
     ap.add_argument("--list", action="store_true", help="只列出标签, 不写文件")
     ap.add_argument("--out", default="pins.tex", help="输出文件名(默认 pins.tex)")
     args = ap.parse_args()
@@ -67,7 +94,9 @@ def main():
             print(f"  {tag:<20} {port}")
         return 0
 
-    # 组装映射: 标签 -> 宏后缀
+    # 组装映射: 标签 -> 宏后缀。后缀一律净化成合法 TeX 控制序列(只含字母),
+    # 否则 \def\PinLED1 定义的是 \PinLED, 调用处会报
+    # "Use of \PinLED doesn't match its definition" 而白费一次 build。
     if args.tag:
         mapping = {}
         for spec in args.tag:
@@ -80,9 +109,39 @@ def main():
                 print(f"错误: 工程里没有标签 {tag!r}。可用: {sorted(pins)}",
                       file=sys.stderr)
                 return 1
-            mapping[tag] = suffix
+            clean = _tex_suffix(suffix)
+            if not clean:
+                print(f"错误: --tag {spec!r} 的宏后缀净化后是空串(后缀必须"
+                      f"含字母)。", file=sys.stderr)
+                return 2
+            if clean != suffix:
+                print(f"提示: 宏后缀 {suffix!r} 含非字母字符, 已净化成 "
+                      f"{clean!r}(TeX 控制序列只吃字母)。", file=sys.stderr)
+            mapping[tag] = clean
     else:
-        mapping = {t: t for t in pins}
+        mapping = {}
+        for t in pins:
+            clean = _tex_suffix(t)
+            if not clean:
+                print(f"错误: 标签 {t!r} 净化后是空串, 无法生成宏名; "
+                      f"请用 --tag {t}=<纯字母宏后缀> 指定。", file=sys.stderr)
+                return 2
+            mapping[t] = clean
+
+    # 查重: 净化后撞名的话, 两个 \def 会互相覆盖, 而 \PinX 用的是后写的那个
+    # —— 引脚静默接错, 编译照过。必须报错, 不能静默。
+    by_suffix = {}
+    for tag, suffix in mapping.items():
+        by_suffix.setdefault(suffix, []).append(tag)
+    clashes = {s: ts for s, ts in by_suffix.items() if len(ts) > 1}
+    if clashes:
+        print("错误: 净化后有标签撞成同一个宏名, 会互相覆盖:", file=sys.stderr)
+        for s, ts in sorted(clashes.items()):
+            print(f"  \\Pin{s}  ← {sorted(ts)}", file=sys.stderr)
+        print("  用 --tag 给它们各自指定不同的纯字母后缀, 例如:", file=sys.stderr)
+        print(f"    python {sys.argv[0]} {args.proj} "
+              f"{_suggest_fix(clashes)}", file=sys.stderr)
+        return 1
 
     lines = [
         "% 本文件由 gen_pins.py 自动生成 —— 不要手改。",

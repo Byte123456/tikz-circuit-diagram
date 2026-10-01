@@ -1,0 +1,94 @@
+% =====================================================================
+%  最小完整示例 —— MCU 引脚 → 1kΩ → NPN 基极;  +5V → LED → 220Ω → 集电极;
+%  发射极 → GND。
+%  =====================================================================
+%  这是"能过两道门的最小图": preamble、引脚、器件、连线、标注、断言、
+%  \DumpCanvas —— 全部必需构件都在。**照抄它当起点**, 按需增减通道。
+%
+%  更复杂的模式（反并联续流管、继电器触点、\Chain 串联支路、\Bus 母线、
+%  \AnnoPack 多行说明块）见 example_photodiode_relay.tex; 宏签名/端子名/坐标名见
+%  references/quickref.md; 摆器件的间距查 references/geometry.md。
+%
+%  编译:  python <skill>/scripts/build.py example_minimal --svg
+%  ⚠ 依赖同目录的 pins.tex（由 gen_pins.py 从你的工程生成, 不要手抄引脚）。
+% =====================================================================
+\documentclass[border=12pt]{standalone}
+\usepackage{ctex}                 % 中文必需; 缺了 build 会报「CJK 字形缺失」
+\usepackage{stm32tikz}
+\input{pins.tex}                  % 引脚由 gen_pins.py 读出
+
+\begin{document}
+\begin{tikzpicture}[font=\small]
+
+% 标注偏移表（place.py 生成）。文件不存在时全部退化成 0 偏移, 编译照常。
+\InputAnnoOffsets{auto_offsets.tex}
+
+% =====================================================================
+%  ① MCU: 一个输出引脚
+% =====================================================================
+\MCUauto{MCU}{-1.2}{-4.0}{3.0cm}{2.6cm}{STM32F103C8T6}{0.9cm}{\PinDrive}
+\coordinate (pin) at (MCU\PinDrive);
+
+% =====================================================================
+%  ② 基极支路:  引脚 ── 1kΩ ── B
+% =====================================================================
+% 行坐标只定义一次, 其余器件用 \RowAt 取同一行（手抄几遍会错位, 而错位
+% 几 pt 不压字不重叠, 排版门一条都不报）。
+\RowAt{rbA}{pin}{2.2}
+\RowAt{rbB}{pin}{3.6}
+\RowAt{qPos}{pin}{4.8}
+\cRes{RB}{rbA}{rbB}{1K}\LogLabel{RB}      % 有 l= 就必须跟 \LogLabel
+\cNPN{Q1}{qPos}                            % B 落在 qPos
+\WireH{pin}{rbA}
+\WireH{rbB}{Q1b}
+\AnnoAt{rbname}{ann, font=\footnotesize}{RB.south}{south,south west}{1kΩ 基极}
+% 位号别用 Q1.north —— 集电极是从 Q1c 竖直上引的, 正上方会压在那根线上
+% （实测报 [文字压线]）。Q1.east 那一侧是空的。
+\AnnoAt{qname}{annb}{Q1.east}{east,north east}{Q1}
+\AnnoAt{qpart}{ann, font=\footnotesize}{Q1.south east}{south east,east}{SS8050}
+
+% =====================================================================
+%  ③ LED 支路:  +5V ── LED阳极|阴极 ── 220Ω ── 集电极
+% =====================================================================
+% 集电极先竖直上引到 LED 行, 再横着走 —— 拐点是"竖线∩行"的交点, 用 |-
+% 取, 不手算。
+\coordinate (ledRowY) at ($(pin)+(0,2.30cm)$);
+\coordinate (collTop) at (Q1c |- ledRowY);
+\WireV{Q1c}{collTop}
+\coordinate (r33A) at ($(collTop)+(0.75cm,0)$);
+\coordinate (r33B) at ($(collTop)+(2.15cm,0)$);
+\cRes{R33}{r33A}{r33B}{220}\LogLabel{R33}
+\WireH{collTop}{r33A}
+% D 类符号 a=阳极 b=阴极, 三角形由 a 指向 b。电流自右(+5V)向左流, 所以
+% **阳极在右** => 起点给右端。接反则反偏不亮, 而门禁查不出方向。
+\coordinate (ledK) at ($(collTop)+(3.10cm,0)$);   % 阴极(左, 靠电阻)
+\coordinate (ledA) at ($(collTop)+(4.10cm,0)$);   % 阳极(右, 靠 +5V)
+\cLED{D1}{ledA}{ledK}
+\WireH{r33B}{D1b}
+\coordinate (vccX) at ($(collTop)+(5.20cm,0)$);
+\WireH{D1a}{vccX}
+\cVCC{+5V}{vccX}
+\AnnoAt{r33name}{ann, font=\footnotesize}{R33.north}{north,north west}{220Ω}
+\AnnoAt{dname}{ann, font=\footnotesize}{D1.south}{south,south east}{LED（阳极朝 +5V）}
+
+% =====================================================================
+%  ④ 发射极 ── GND
+% =====================================================================
+\WireV{Q1e}{$(Q1e)+(0,-0.9cm)$}
+\cGND{$(Q1e)+(0,-0.9cm)$}
+
+% =====================================================================
+%  ⑤ 网络断言 —— 唯一能抓「接到错的节点」的手段
+% =====================================================================
+% 写 \Expect 之前先看 build 打印的网表: 连通性分析里**元件本体是网络边界**,
+% 隔着电阻本体两点就是两张网。凭直觉写会被报 [接错], 而门禁报得对。
+\Expect{RB.a}{MCU.\PinDrive}
+\Expect{Q1.b}{RB.b}
+\Expect{Q1.c}{R33.a}
+\Expect{D1.b}{R33.b}
+\Expect{D1.a}{+5V}
+\Expect{Q1.e}{GND}
+
+\DumpCanvas                       % 必须在 \end{tikzpicture} 之前
+\end{tikzpicture}
+\end{document}

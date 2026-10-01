@@ -70,6 +70,7 @@ cp -r tikz-circuit-diagram <项目>/.agents/skills/
 
 ```bash
 # 引脚从工程读，不要手抄
+# （宏后缀只能含字母；标签如 LED1/KEY_SPEED 会被净化，撞名时报错并给改法）
 python scripts/gen_pins.py /path/to/fw --tag LED_R=ADC --tag LED_G=Drive
 
 # 一键闭环：编译 → 自动摆标注 → 再编译 → 两道门 → SVG
@@ -83,6 +84,11 @@ python scripts/selftest_tex.py                            # 回归 58 用例
 
 完整的工作流、宏速查、电气陷阱见 **[SKILL.md](SKILL.md)**（写图前读
 **[references/quickref.md](references/quickref.md)**）。
+
+**最小读取集**：画一张图只需要 `SKILL.md` + `references/quickref.md` +
+`assets/example_minimal.tex` 三份，读完即可动手；符号间距按需查
+`references/geometry.md`。`stm32tikz.sty`（宏包源码）与 `sidecar-format.md`
+（改检查器才读）都不必读。
 
 ## 三件自动布局工具
 
@@ -123,7 +129,8 @@ scripts/
   selftest_tex.py            回归测试（58 用例）
 assets/
   stm32tikz.sty              核心宏包
-  example_photodiode_relay.tex  完整示例，可照抄
+  example_minimal.tex        最小可编译样例，照抄当起点
+  example_photodiode_relay.tex  完整带讲解示例（反并联/继电器触点/\Chain/\Bus）
 ```
 
 ## 一个值得记下来的失效模式
